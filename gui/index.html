@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Qwen Harness · Control Room</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <div>
+        <p class="eyebrow">qwen-harness</p>
+        <h1>Control Room</h1>
+      </div>
+    </div>
+    <div class="topbar-status">
+      <span class="status-pill" id="ollama-status" data-state="checking">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="ollama-status-label">Checking Ollama…</span>
+      </span>
+      <span class="status-pill" id="model-status" data-state="checking">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="model-status-label">config.py: —</span>
+      </span>
+    </div>
+  </header>
+
+  <main class="workspace">
+
+    <section class="panel roster" aria-label="Agent roster">
+      <div class="panel-head">
+        <h2>Agents</h2>
+        <p class="panel-copy">One avatar per agent. State follows the tool-use loop live.</p>
+      </div>
+      <div id="roster-list" class="roster-list"></div>
+      <button id="add-agent" class="ghost-button" type="button">+ Add agent</button>
+    </section>
+
+    <section class="panel stage" aria-label="Selected agent">
+      <div class="panel-head stage-head">
+        <div>
+          <h2 id="stage-name">—</h2>
+          <p class="panel-copy" id="stage-model">—</p>
+        </div>
+        <span class="status-pill" id="stage-state" data-state="idle">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="stage-state-label">idle</span>
+        </span>
+      </div>
+      <div class="stage-avatar" id="stage-avatar"></div>
+      <div class="stage-controls">
+        <label class="field">
+          <span>Avatar</span>
+          <select id="avatar-picker"></select>
+        </label>
+        <label class="field">
+          <span>State</span>
+          <select id="state-picker"></select>
+        </label>
+        <label class="field">
+          <span>Model</span>
+          <select id="model-picker"></select>
+        </label>
+      </div>
+    </section>
+
+    <section class="panel console" aria-label="Run console">
+      <div class="panel-head">
+        <h2>Console</h2>
+        <p class="panel-copy" id="mode-copy">Demo mode — scripted, no model calls. Swap to Live once a model has finished downloading.</p>
+      </div>
+      <div class="run-buttons" id="run-buttons"></div>
+      <div class="mode-toggle">
+        <button class="mode-button is-active" id="mode-demo" type="button">Demo mode</button>
+        <button class="mode-button" id="mode-live" type="button">Live mode</button>
+      </div>
+      <div class="transcript" id="transcript">
+        <p class="transcript-empty">Pick a script above to preview a run, or switch to Live mode once Ollama has a model ready.</p>
+      </div>
+      <form class="composer" id="composer">
+        <input id="composer-input" type="text" placeholder="Message the selected agent…" autocomplete="off" />
+        <button type="submit">Send</button>
+      </form>
+    </section>
+
+  </main>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

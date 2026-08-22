@@ -1,0 +1,92 @@
+[
+  {
+    "id": "01_hello",
+    "label": "01 · hello",
+    "agentName": "hello",
+    "model": "qwen3:14b",
+    "description": "Bare chat, no tools.",
+    "events": [
+      { "type": "user", "text": "What is the capital of France, and what is it known for?", "state": "listening" },
+      { "type": "state", "state": "thinking", "holdMs": 1400 },
+      { "type": "assistant", "text": "The capital of France is Paris. It's known for the Eiffel Tower, the Louvre, and being one of the world's centres of art, fashion, and cuisine.", "state": "happy" },
+      { "type": "state", "state": "idle", "holdMs": 800 }
+    ]
+  },
+  {
+    "id": "02_with_tools",
+    "label": "02 · with tools",
+    "agentName": "file-agent",
+    "model": "qwen3:14b",
+    "description": "File system tools: read_file, write_file, list_dir, run_shell.",
+    "events": [
+      { "type": "user", "text": "What's in the tools directory?", "state": "listening" },
+      { "type": "state", "state": "thinking", "holdMs": 900 },
+      { "type": "tool_call", "name": "list_dir", "args": { "path": "tools/" }, "state": "working" },
+      { "type": "tool_result", "text": "['__init__.py', 'computer.py', 'browser.py', 'files.py']", "holdMs": 700 },
+      { "type": "state", "state": "thinking", "holdMs": 700 },
+      { "type": "assistant", "text": "The tools/ directory has four files: __init__.py (the tool registry), computer.py, browser.py, and files.py.", "state": "happy" },
+      { "type": "state", "state": "idle", "holdMs": 800 }
+    ]
+  },
+  {
+    "id": "03_multi_agent",
+    "label": "03 · multi-agent",
+    "agentName": "orchestrator",
+    "model": "qwen3:14b",
+    "description": "Pipeline: researcher → writer → critic.",
+    "roles": ["researcher", "writer", "critic"],
+    "events": [
+      { "type": "user", "text": "Topic: the James Webb Space Telescope", "state": "listening" },
+      { "type": "handoff", "role": "researcher", "state": "searching", "holdMs": 400 },
+      { "type": "state", "state": "working", "holdMs": 1100 },
+      { "type": "assistant", "role": "researcher", "text": "• Launched Dec 2021 · • Largest infrared space telescope ever built · • Successor to Hubble · • Orbits the Sun-Earth L2 point", "state": "curious" },
+      { "type": "handoff", "role": "writer", "state": "thinking", "holdMs": 400 },
+      { "type": "state", "state": "working", "holdMs": 1200 },
+      { "type": "assistant", "role": "writer", "text": "Since its December 2021 launch, the James Webb Space Telescope has redefined how we see the cosmos — peering further into infrared light than any observatory before it, from its perch nearly a million miles away at the Sun–Earth L2 point.", "state": "happy" },
+      { "type": "handoff", "role": "critic", "state": "suspicious", "holdMs": 400 },
+      { "type": "state", "state": "working", "holdMs": 1000 },
+      { "type": "assistant", "role": "critic", "text": "Strengths: vivid opening, accurate facts, strong closing image. Improvement: name one discovery; clarify 'redefined' with a concrete example.", "state": "proud" },
+      { "type": "state", "state": "idle", "holdMs": 800 }
+    ]
+  },
+  {
+    "id": "04_computer_use",
+    "label": "04 · computer use",
+    "agentName": "computer-agent",
+    "model": "qwen3:14b",
+    "description": "Screenshot, click, type, browser automation.",
+    "events": [
+      { "type": "user", "text": "Go to news.ycombinator.com and tell me the top story.", "state": "listening" },
+      { "type": "state", "state": "thinking", "holdMs": 700 },
+      { "type": "tool_call", "name": "browser_navigate", "args": { "url": "https://news.ycombinator.com" }, "state": "searching" },
+      { "type": "tool_result", "text": "navigated", "holdMs": 600 },
+      { "type": "tool_call", "name": "screenshot", "args": {}, "state": "working" },
+      { "type": "tool_result", "text": "screenshot saved → /tmp/shot_0032.png", "holdMs": 600 },
+      { "type": "state", "state": "thinking", "holdMs": 800 },
+      { "type": "assistant", "text": "The top story right now is about a new open-source inference engine hitting 40k stars in a week.", "state": "excited" },
+      { "type": "state", "state": "idle", "holdMs": 800 }
+    ]
+  },
+  {
+    "id": "05_swap_models",
+    "label": "05 · swap models",
+    "agentName": "swappable",
+    "model": "qwen3:14b",
+    "description": "Hot-swap the active model mid-conversation.",
+    "events": [
+      { "type": "system", "text": "Starting on: qwen3:14b" },
+      { "type": "user", "text": "Tell me one interesting fact about the Moon.", "state": "listening" },
+      { "type": "state", "state": "thinking", "holdMs": 900 },
+      { "type": "assistant", "text": "The Moon is slowly drifting away from Earth — about 3.8 cm per year.", "state": "happy" },
+      { "type": "system", "text": "→ Swapped to qwen3:8b", "model": "qwen3:8b" },
+      { "type": "user", "text": "Now tell me one about Mars.", "state": "listening" },
+      { "type": "state", "state": "thinking", "holdMs": 900 },
+      { "type": "assistant", "text": "Mars has the largest volcano in the solar system, Olympus Mons — almost 3x the height of Everest.", "state": "happy" },
+      { "type": "system", "text": "→ Swapped back to qwen3:14b", "model": "qwen3:14b" },
+      { "type": "user", "text": "Summarise both facts in one sentence.", "state": "listening" },
+      { "type": "state", "state": "thinking", "holdMs": 900 },
+      { "type": "assistant", "text": "The Moon is drifting from us at 3.8cm/year while Mars hosts Olympus Mons, the solar system's tallest volcano.", "state": "proud" },
+      { "type": "state", "state": "idle", "holdMs": 800 }
+    ]
+  }
+]

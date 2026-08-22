@@ -1,0 +1,41 @@
+{
+  "active": "qwen3:14b",
+  "models": [
+    {
+      "key": "qwen3:8b",
+      "name": "qwen3:8b",
+      "base_url": "http://localhost:11434/v1",
+      "local": true
+    },
+    {
+      "key": "qwen3:14b",
+      "name": "qwen3:14b",
+      "base_url": "http://localhost:11434/v1",
+      "local": true
+    },
+    {
+      "key": "deepseek-r1:8b",
+      "name": "deepseek-r1:8b",
+      "base_url": "http://localhost:11434/v1",
+      "local": true
+    },
+    {
+      "key": "deepseek-r1:14b",
+      "name": "deepseek-r1:14b",
+      "base_url": "http://localhost:11434/v1",
+      "local": true
+    },
+    {
+      "key": "gpt-4o",
+      "name": "gpt-4o",
+      "base_url": "https://api.openai.com/v1",
+      "local": false
+    },
+    {
+      "key": "gpt-4o-mini",
+      "name": "gpt-4o-mini",
+      "base_url": "https://api.openai.com/v1",
+      "local": false
+    }
+  ]
+}
