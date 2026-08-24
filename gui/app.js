@@ -7,6 +7,9 @@
 import { renderFileTree, withPaths } from './filetree.js';
 import {
   apiListDir, apiReadFile, apiWriteFile, apiExec, apiHealth,
+  apiFsGrants, apiFsGrant, apiCreateFile, apiCreateDir, apiMovePath, apiDeletePath,
+  apiWebSearch, apiWebScrape, apiGithubStatus, apiGithubConnect, apiGithubDisconnect, apiGithubRepos,
+  isDesktopClient, desktopChooseDirectory, desktopChooseFile,
   getDirectory, setDirectory, getHotphrases, setHotphrases,
   getConnectors, setConnectorEnabled, CONNECTOR_DEFS,
   trackComposerFocus, insertIntoLastComposer,
@@ -306,6 +309,7 @@ function openDrawer(capId, cwd) {
   if (capId === 'terminal') return renderTerminalDrawer(cwd);
   if (capId === 'browser') return renderBrowserDrawer();
   if (capId === 'github') return renderGithubDrawer();
+  if (capId === 'websearch') return renderWebsearchDrawer();
 }
 
 function renderSettingsDrawer() {
@@ -317,7 +321,7 @@ function renderSettingsDrawer() {
     row.className = 'connector-row';
     const label = document.createElement('div');
     label.className = 'connector-label';
-    label.innerHTML = `<span>${def.icon}</span><span>${def.label}</span>` + (def.comingSoon ? '<span class="connector-note">(coming last)</span>' : '');
+    label.innerHTML = `<span>${def.icon}</span><span>${def.label}</span>`;
     const toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'toggle-switch' + (state[def.id] ? ' is-on' : '');
@@ -436,13 +440,138 @@ function renderBrowserDrawer() {
   drawerBody.append(form, frame);
 }
 
-function renderGithubDrawer() {
+async function renderGithubDrawer() {
   drawerTitle.textContent = 'GitHub';
   drawerBody.replaceChildren();
   const p = document.createElement('p');
   p.className = 'panel-copy';
-  p.textContent = 'Persistent GitHub connection is planned as the last piece of this build — everything else comes first.';
+  p.textContent = 'Loading…';
   drawerBody.append(p);
+
+  let status;
+  try { status = await apiGithubStatus(); }
+  catch (err) { p.textContent = `⚠ ${err.message} — is gui/server.py running? (use wake-up.sh)`; return; }
+
+  drawerBody.replaceChildren();
+
+  if (status.connected) {
+    const card = document.createElement('div');
+    card.className = 'connector-row';
+    card.innerHTML = `
+      <div class="connector-label">
+        <img src="${status.avatar_url || ''}" alt="" width="28" height="28" style="border:2px solid var(--border);" />
+        <span>${status.name ? `${status.name} (@${status.login})` : `@${status.login}`}</span>
+      </div>`;
+    const disconnectBtn = document.createElement('button');
+    disconnectBtn.type = 'button'; disconnectBtn.className = 'mode-button mode-button-danger';
+    disconnectBtn.textContent = 'Disconnect';
+    disconnectBtn.addEventListener('click', async () => { await apiGithubDisconnect(); renderGithubDrawer(); });
+    card.append(disconnectBtn);
+    drawerBody.append(card);
+
+    const reposHeading = document.createElement('p');
+    reposHeading.className = 'panel-copy';
+    reposHeading.textContent = 'Repositories:';
+    reposHeading.style.marginTop = '10px';
+    drawerBody.append(reposHeading);
+
+    const list = document.createElement('div');
+    list.className = 'drawer-list';
+    list.textContent = 'Loading repos…';
+    drawerBody.append(list);
+    try {
+      const { repos } = await apiGithubRepos();
+      list.replaceChildren();
+      if (repos.length === 0) {
+        list.textContent = 'No repositories found.';
+      }
+      for (const r of repos) {
+        const row = document.createElement('a');
+        row.className = 'drawer-list-row';
+        row.href = r.html_url; row.target = '_blank'; row.rel = 'noopener';
+        row.innerHTML = `<span>${r.private ? '🔒' : '📂'}</span><span>${r.full_name}</span>`;
+        list.append(row);
+      }
+    } catch (err) {
+      list.textContent = `⚠ ${err.message}`;
+    }
+  } else {
+    const p2 = document.createElement('p');
+    p2.className = 'panel-copy';
+    p2.innerHTML = 'Paste a <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener">Personal Access Token</a> (repo scope is enough for read + issues). It\'s stored locally on this Mac only (<code>~/.qwen-harness/secrets.json</code>), never in the browser or in this repo.';
+    const form = document.createElement('form');
+    form.className = 'composer';
+    form.innerHTML = `<input type="password" placeholder="ghp_…" autocomplete="off" /><button type="submit">Connect</button>`;
+    const errorEl = document.createElement('p');
+    errorEl.className = 'panel-copy';
+    errorEl.style.color = 'var(--primary)';
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = form.querySelector('input');
+      const token = input.value.trim();
+      if (!token) return;
+      form.querySelector('button').disabled = true;
+      errorEl.textContent = 'Connecting…';
+      try {
+        await apiGithubConnect(token);
+        renderGithubDrawer();
+      } catch (err) {
+        errorEl.textContent = `⚠ ${err.message}`;
+        form.querySelector('button').disabled = false;
+      }
+    });
+    drawerBody.append(p2, form, errorEl);
+  }
+}
+
+async function renderWebsearchDrawer() {
+  drawerTitle.textContent = 'Web search';
+  drawerBody.replaceChildren();
+  const form = document.createElement('form');
+  form.className = 'composer';
+  form.innerHTML = `<input type="text" placeholder="Search the web…" autocomplete="off" /><button type="submit">Search</button>`;
+  const results = document.createElement('div');
+  results.className = 'drawer-list';
+  results.style.marginTop = '10px';
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const input = form.querySelector('input');
+    const query = input.value.trim();
+    if (!query) return;
+    results.replaceChildren();
+    results.textContent = 'Searching…';
+    try {
+      const { results: hits } = await apiWebSearch(query, 6);
+      results.replaceChildren();
+      if (hits.length === 0) { results.textContent = 'No results.'; return; }
+      for (const hit of hits) {
+        const row = document.createElement('div');
+        row.style.padding = '8px 10px';
+        row.style.borderBottom = '2px solid var(--border)';
+        row.innerHTML = `<a href="${hit.url}" target="_blank" rel="noopener" style="font-weight:700;">${hit.title}</a>
+          <div class="connector-note">${hit.url}</div>
+          <div class="panel-copy">${hit.snippet}</div>`;
+        const scrapeBtn = document.createElement('button');
+        scrapeBtn.type = 'button'; scrapeBtn.className = 'hotphrase-remove'; scrapeBtn.style.width = 'auto'; scrapeBtn.style.padding = '4px 8px';
+        scrapeBtn.textContent = 'Insert summary →';
+        scrapeBtn.addEventListener('click', async () => {
+          scrapeBtn.textContent = 'Fetching…'; scrapeBtn.disabled = true;
+          try {
+            const page = await apiWebScrape(hit.url);
+            insertIntoLastComposer(`\n\nSource: ${hit.url}\n${page.text.slice(0, 1500)}`);
+          } catch (err) {
+            scrapeBtn.textContent = `⚠ ${err.message}`;
+          }
+        });
+        row.append(scrapeBtn);
+        results.append(row);
+      }
+    } catch (err) {
+      results.replaceChildren();
+      results.textContent = `⚠ ${err.message}`;
+    }
+  });
+  drawerBody.append(form, results);
 }
 
 const capBarInstances = [];
@@ -475,7 +604,84 @@ const codeFileStatusLabel = $('#code-file-status-label');
 const codeEditor = $('#code-editor');
 const codeSaveBtn = $('#code-save');
 let selectedFilePath = null;
+let selectedNode = null;
 let currentTreeRoot = '.';
+let grantedRoots = [];
+
+function pathJoin(base, name) {
+  const trimmed = String(name || '').trim().replace(/^\/+/, '');
+  if (!trimmed) return base;
+  return `${String(base || '.').replace(/\/+$/, '')}/${trimmed}`;
+}
+
+function dirname(path) {
+  const value = String(path || '');
+  const idx = value.lastIndexOf('/');
+  return idx > 0 ? value.slice(0, idx) : '.';
+}
+
+function basename(path) {
+  return String(path || '').split('/').filter(Boolean).pop() || '';
+}
+
+function currentActionDir() {
+  if (selectedNode?.type === 'dir') return selectedNode.path;
+  if (selectedNode?.type === 'file') return dirname(selectedNode.path);
+  return currentTreeRoot || getDirectory() || '.';
+}
+
+function setSelectedNode(node) {
+  selectedNode = node;
+  const hasSelection = Boolean(node);
+  $('#filetree-rename').disabled = !hasSelection;
+  $('#filetree-delete').disabled = !hasSelection;
+}
+
+async function refreshGrants() {
+  try {
+    const data = await apiFsGrants();
+    grantedRoots = data.roots || [];
+    const strip = $('#filetree-grants');
+    strip.replaceChildren();
+    const title = document.createElement('div');
+    title.className = 'permission-strip-row';
+    title.innerHTML = '<strong>Granted roots</strong>';
+    strip.append(title);
+    for (const root of grantedRoots.slice(0, 4)) {
+      const row = document.createElement('div');
+      row.className = 'permission-strip-row';
+      row.innerHTML = `<span>•</span><span class="permission-strip-path" title="${root}">${root}</span>`;
+      strip.append(row);
+    }
+    if (grantedRoots.length > 4) {
+      const row = document.createElement('div');
+      row.className = 'permission-strip-row';
+      row.textContent = `+ ${grantedRoots.length - 4} more`;
+      strip.append(row);
+    }
+  } catch {
+    $('#filetree-grants').textContent = 'Permission state unavailable.';
+  }
+}
+
+async function grantAndOpenFolder() {
+  try {
+    let path;
+    if (isDesktopClient()) {
+      const result = await desktopChooseDirectory();
+      path = result.path;
+    } else {
+      path = prompt('Folder path to grant:');
+    }
+    if (!path) return;
+    await apiFsGrant(path);
+    await refreshGrants();
+    await loadCodeTree(path);
+  } catch (err) {
+    if (err.cancelled) return;
+    filetreeEl.innerHTML = `<p class="transcript-empty">⚠ ${err.message}</p>`;
+  }
+}
 
 async function loadCodeTree(path) {
   currentTreeRoot = path;
@@ -483,8 +689,8 @@ async function loadCodeTree(path) {
     const { entries } = await apiListDir(path);
     const tree = entries.map(e => ({ name: e.name, path: e.path, type: e.type }));
     renderFileTree(filetreeEl, tree, {
-      onSelect: openFile,
-      selectedPath: selectedFilePath,
+      onSelect: selectTreeNode,
+      selectedPath: selectedNode?.path || selectedFilePath,
       loadChildren: async (node) => {
         const { entries } = await apiListDir(node.path);
         return entries.map(e => ({ name: e.name, path: e.path, type: e.type }));
@@ -493,11 +699,31 @@ async function loadCodeTree(path) {
     $('#filetree-path').value = path;
     setDirectory(path);
   } catch (err) {
-    filetreeEl.innerHTML = `<p class="transcript-empty">⚠ ${err.message}<br>Is gui/server.py running? Use <code>./wake-up.sh</code> or <code>python3 gui/server.py</code>.</p>`;
+    const action = err.permission_required
+      ? '<br><button class="mode-button" id="grant-failed-path" type="button">Grant folder access</button>'
+      : '<br>Is gui/server.py running? Use <code>./wake-up.sh</code> or <code>python3 gui/server.py</code>.';
+    filetreeEl.innerHTML = `<p class="transcript-empty">⚠ ${err.message}${action}</p>`;
+    $('#grant-failed-path')?.addEventListener('click', grantAndOpenFolder);
   }
 }
 
+async function selectTreeNode(node) {
+  setSelectedNode(node);
+  if (node.type === 'dir') {
+    selectedFilePath = null;
+    codeFileName.textContent = node.path;
+    codeFileStatus.dataset.state = 'off';
+    codeFileStatusLabel.textContent = 'folder selected';
+    codeSaveBtn.disabled = true;
+    codeEditor.disabled = true;
+    codeEditor.value = `// Folder selected\n// ${node.path}`;
+    return;
+  }
+  await openFile(node);
+}
+
 async function openFile(node) {
+  setSelectedNode(node);
   selectedFilePath = node.path;
   codeFileName.textContent = node.path;
   codeFileStatus.dataset.state = 'checking';
@@ -518,6 +744,11 @@ async function openFile(node) {
   }
 }
 
+async function refreshCodeTree() {
+  await refreshGrants();
+  await loadCodeTree(currentTreeRoot || getDirectory() || '.');
+}
+
 codeSaveBtn.addEventListener('click', async () => {
   if (!selectedFilePath) return;
   codeFileStatusLabel.textContent = 'saving…';
@@ -528,6 +759,77 @@ codeSaveBtn.addEventListener('click', async () => {
   } catch (err) {
     codeFileStatus.dataset.state = 'off';
     codeFileStatusLabel.textContent = `save failed: ${err.message}`;
+  }
+});
+
+$('#filetree-open-folder').addEventListener('click', grantAndOpenFolder);
+$('#filetree-refresh').addEventListener('click', refreshCodeTree);
+
+$('#filetree-new-file').addEventListener('click', async () => {
+  const base = currentActionDir();
+  const name = prompt(`New file inside:\n${base}`);
+  if (!name) return;
+  try {
+    const result = await apiCreateFile(pathJoin(base, name));
+    await refreshCodeTree();
+    await openFile({ name: basename(result.path), path: result.path, type: 'file' });
+  } catch (err) {
+    alert(`Could not create file:\n${err.message}`);
+  }
+});
+
+$('#filetree-new-folder').addEventListener('click', async () => {
+  const base = currentActionDir();
+  const name = prompt(`New folder inside:\n${base}`);
+  if (!name) return;
+  try {
+    const result = await apiCreateDir(pathJoin(base, name));
+    await refreshCodeTree();
+    setSelectedNode({ name: basename(result.path), path: result.path, type: 'dir' });
+  } catch (err) {
+    alert(`Could not create folder:\n${err.message}`);
+  }
+});
+
+$('#filetree-rename').addEventListener('click', async () => {
+  if (!selectedNode) return;
+  const nextName = prompt('Rename to:', selectedNode.name || basename(selectedNode.path));
+  if (!nextName || nextName === selectedNode.name) return;
+  const dest = pathJoin(dirname(selectedNode.path), nextName);
+  const wasFile = selectedNode.type === 'file';
+  try {
+    const result = await apiMovePath(selectedNode.path, dest);
+    selectedFilePath = wasFile ? result.path : null;
+    await refreshCodeTree();
+    if (wasFile) {
+      await openFile({ name: basename(result.path), path: result.path, type: 'file' });
+    } else {
+      setSelectedNode({ name: basename(result.path), path: result.path, type: 'dir' });
+    }
+  } catch (err) {
+    alert(`Could not rename:\n${err.message}`);
+  }
+});
+
+$('#filetree-delete').addEventListener('click', async () => {
+  if (!selectedNode) return;
+  const recursive = selectedNode.type === 'dir';
+  const ok = confirm(`Delete ${recursive ? 'folder and its contents' : 'file'}?\n\n${selectedNode.path}`);
+  if (!ok) return;
+  try {
+    await apiDeletePath(selectedNode.path, recursive);
+    if (selectedFilePath === selectedNode.path) {
+      selectedFilePath = null;
+      codeEditor.value = '';
+      codeSaveBtn.disabled = true;
+      codeFileName.textContent = 'Select a file';
+      codeFileStatus.dataset.state = 'off';
+      codeFileStatusLabel.textContent = 'deleted';
+    }
+    setSelectedNode(null);
+    await refreshCodeTree();
+  } catch (err) {
+    alert(`Could not delete:\n${err.message}`);
   }
 });
 
@@ -933,6 +1235,7 @@ renderAttachmentChips();
 await renderStage();
 renderTranscript();
 renderHubFocusSelect();
+await refreshGrants();
 await loadCodeTree(getDirectory() || '.');
 pollBackend(); pollOllama();
 setInterval(pollBackend, 8000);

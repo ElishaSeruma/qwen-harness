@@ -88,7 +88,8 @@ export function renderFileTree(container, tree, opts) {
     btn.append(label);
 
     btn.addEventListener('click', async () => {
-      if (!isFolder) return opts.onSelect(node);
+      opts.onSelect(node);
+      if (!isFolder) return;
       if (expanded.has(node.path)) {
         expanded.delete(node.path);
         renderFileTree(container, tree, opts);

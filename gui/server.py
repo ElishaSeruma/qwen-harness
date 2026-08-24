@@ -9,7 +9,13 @@ static frontend cannot do on its own:
   GET  /api/health                          -> {ok:true}
   GET  /api/fs/list?path=<abs>               -> directory listing
   GET  /api/fs/read?path=<abs>               -> raw file content
+  GET  /api/fs/grants                        -> allowed filesystem roots
+  POST /api/fs/grant   {path}                -> grant a folder root
   POST /api/fs/write   {path, content}       -> write a file
+  POST /api/fs/mkdir   {path}                -> create a directory
+  POST /api/fs/touch   {path, content?}      -> create a file
+  POST /api/fs/move    {path, dest}          -> rename/move a file or directory
+  POST /api/fs/delete  {path, recursive?}    -> delete a file or empty directory
   POST /api/exec       {command, cwd}        -> run a shell command, return output
   GET  /api/web/search?q=<query>             -> web search results (no API key)
   GET  /api/web/scrape?url=<url>             -> readable text of a page
@@ -24,6 +30,7 @@ to be exposed beyond your own machine.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +41,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))  # so `tools.*` importable, matching the Python agents
 MAX_READ_BYTES = 3 * 1024 * 1024  # 3MB cap so the browser doesn't choke
 EXEC_TIMEOUT_S = 30
+STATE_DIR = Path.home() / '.qwen-harness'
+PERMISSIONS_PATH = STATE_DIR / 'permissions.json'
 
 SKIP_DIR_NAMES = {'.git', 'node_modules', '__pycache__', '.DS_Store'}
 
@@ -81,8 +90,61 @@ class Handler(BaseHTTPRequestHandler):
 
     def _resolve_path(self, raw_path):
         if not raw_path:
-            return Path.home()
+            return REPO_ROOT
         return Path(unquote(raw_path)).expanduser().resolve()
+
+    def _load_grants(self):
+        roots = {str(REPO_ROOT)}
+        try:
+            if PERMISSIONS_PATH.exists():
+                data = json.loads(PERMISSIONS_PATH.read_text(encoding='utf-8'))
+                roots.update(data.get('roots', []))
+        except (OSError, json.JSONDecodeError):
+            pass
+        valid = []
+        for root in roots:
+            try:
+                path = Path(root).expanduser().resolve()
+                if path.exists() and path.is_dir():
+                    valid.append(str(path))
+            except OSError:
+                continue
+        return sorted(set(valid))
+
+    def _save_grants(self, roots):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        PERMISSIONS_PATH.write_text(json.dumps({'roots': sorted(set(roots))}, indent=2), encoding='utf-8')
+
+    def _is_granted(self, path):
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        for root in self._load_grants():
+            root_path = Path(root)
+            if resolved == root_path:
+                return True
+            try:
+                resolved.relative_to(root_path)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _require_grant(self, path):
+        if self._is_granted(path):
+            return False
+        self._send_json({
+            'error': f'permission required for {path}',
+            'permission_required': True,
+            'path': str(path),
+            'grants': self._load_grants(),
+        }, 403)
+        return True
+
+    def _require_parent_grant(self, path):
+        parent = path if path.exists() and path.is_dir() else path.parent
+        return self._require_grant(parent)
 
     # ── routing ──────────────────────────────────────────────────────────
     def do_GET(self):
@@ -93,6 +155,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_list(parse_qs(parsed.query))
         if parsed.path == '/api/fs/read':
             return self._handle_read(parse_qs(parsed.query))
+        if parsed.path == '/api/fs/grants':
+            return self._handle_grants()
         if parsed.path == '/api/web/search':
             return self._handle_web_search(parse_qs(parsed.query))
         if parsed.path == '/api/web/scrape':
@@ -107,6 +171,16 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == '/api/fs/write':
             return self._handle_write()
+        if parsed.path == '/api/fs/grant':
+            return self._handle_grant()
+        if parsed.path == '/api/fs/mkdir':
+            return self._handle_mkdir()
+        if parsed.path == '/api/fs/touch':
+            return self._handle_touch()
+        if parsed.path == '/api/fs/move':
+            return self._handle_move()
+        if parsed.path == '/api/fs/delete':
+            return self._handle_delete()
         if parsed.path == '/api/exec':
             return self._handle_exec()
         if parsed.path == '/api/github/connect':
@@ -145,6 +219,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_list(self, query):
         raw = query.get('path', [''])[0]
         path = self._resolve_path(raw)
+        denied = self._require_grant(path)
+        if denied:
+            return denied
         if not path.exists() or not path.is_dir():
             return self._send_json({'error': f'not a directory: {path}'}, 400)
         entries = []
@@ -171,6 +248,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_read(self, query):
         raw = query.get('path', [''])[0]
         path = self._resolve_path(raw)
+        denied = self._require_grant(path)
+        if denied:
+            return denied
         if not path.exists() or not path.is_file():
             return self._send_json({'error': f'not a file: {path}'}, 400)
         try:
@@ -182,6 +262,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({'error': str(exc)}, 500)
         self._send_text(text)
 
+    def _handle_grants(self):
+        self._send_json({'roots': self._load_grants(), 'default': str(REPO_ROOT)})
+
+    def _handle_grant(self):
+        body = self._read_json_body()
+        raw = body.get('path')
+        if not raw:
+            return self._send_json({'error': 'missing path'}, 400)
+        path = self._resolve_path(raw)
+        if path.is_file():
+            path = path.parent
+        if not path.exists() or not path.is_dir():
+            return self._send_json({'error': f'not a directory: {path}'}, 400)
+        roots = self._load_grants()
+        roots.append(str(path))
+        try:
+            self._save_grants(roots)
+        except OSError as exc:
+            return self._send_json({'error': str(exc)}, 500)
+        self._send_json({'ok': True, 'roots': self._load_grants(), 'path': str(path)})
+
     def _handle_write(self):
         body = self._read_json_body()
         raw = body.get('path')
@@ -189,12 +290,98 @@ class Handler(BaseHTTPRequestHandler):
         if not raw:
             return self._send_json({'error': 'missing path'}, 400)
         path = self._resolve_path(raw)
+        denied = self._require_parent_grant(path)
+        if denied:
+            return denied
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding='utf-8')
         except OSError as exc:
             return self._send_json({'error': str(exc)}, 500)
         self._send_json({'ok': True, 'path': str(path), 'bytes': len(content.encode('utf-8'))})
+
+    def _handle_mkdir(self):
+        body = self._read_json_body()
+        raw = body.get('path')
+        if not raw:
+            return self._send_json({'error': 'missing path'}, 400)
+        path = self._resolve_path(raw)
+        denied = self._require_parent_grant(path)
+        if denied:
+            return denied
+        try:
+            path.mkdir(parents=bool(body.get('parents', True)), exist_ok=False)
+        except FileExistsError:
+            return self._send_json({'error': f'already exists: {path}'}, 409)
+        except OSError as exc:
+            return self._send_json({'error': str(exc)}, 500)
+        self._send_json({'ok': True, 'path': str(path), 'type': 'dir'})
+
+    def _handle_touch(self):
+        body = self._read_json_body()
+        raw = body.get('path')
+        content = body.get('content', '')
+        if not raw:
+            return self._send_json({'error': 'missing path'}, 400)
+        path = self._resolve_path(raw)
+        denied = self._require_parent_grant(path)
+        if denied:
+            return denied
+        if path.exists():
+            return self._send_json({'error': f'already exists: {path}'}, 409)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding='utf-8')
+        except OSError as exc:
+            return self._send_json({'error': str(exc)}, 500)
+        self._send_json({'ok': True, 'path': str(path), 'type': 'file'})
+
+    def _handle_move(self):
+        body = self._read_json_body()
+        raw = body.get('path')
+        dest_raw = body.get('dest')
+        if not raw or not dest_raw:
+            return self._send_json({'error': 'missing path or dest'}, 400)
+        path = self._resolve_path(raw)
+        dest = self._resolve_path(dest_raw)
+        denied = self._require_grant(path) or self._require_parent_grant(dest)
+        if denied:
+            return denied
+        if not path.exists():
+            return self._send_json({'error': f'not found: {path}'}, 400)
+        if dest.exists():
+            return self._send_json({'error': f'already exists: {dest}'}, 409)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(dest)
+        except OSError as exc:
+            return self._send_json({'error': str(exc)}, 500)
+        self._send_json({'ok': True, 'path': str(dest), 'from': str(path)})
+
+    def _handle_delete(self):
+        body = self._read_json_body()
+        raw = body.get('path')
+        if not raw:
+            return self._send_json({'error': 'missing path'}, 400)
+        path = self._resolve_path(raw)
+        denied = self._require_grant(path)
+        if denied:
+            return denied
+        if path == REPO_ROOT:
+            return self._send_json({'error': 'refusing to delete repo root'}, 400)
+        if not path.exists():
+            return self._send_json({'error': f'not found: {path}'}, 400)
+        try:
+            if path.is_dir():
+                if body.get('recursive'):
+                    shutil.rmtree(path)
+                else:
+                    path.rmdir()
+            else:
+                path.unlink()
+        except OSError as exc:
+            return self._send_json({'error': str(exc)}, 500)
+        self._send_json({'ok': True, 'path': str(path)})
 
     # ── terminal / sandbox exec ─────────────────────────────────────────
     def _handle_exec(self):
@@ -207,6 +394,9 @@ class Handler(BaseHTTPRequestHandler):
             if pattern in command:
                 return self._send_json({'ok': False, 'error': f"blocked dangerous command pattern: '{pattern}'"}, 400)
         cwd_path = self._resolve_path(cwd)
+        denied = self._require_grant(cwd_path)
+        if denied:
+            return denied
         try:
             proc = subprocess.run(
                 command, shell=True, cwd=str(cwd_path),

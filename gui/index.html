@@ -105,6 +105,15 @@
           <input id="filetree-path" type="text" class="path-input" placeholder="/Users/you/some/project" />
           <button id="filetree-go" type="button" class="mode-button">Go</button>
         </div>
+        <div class="filetree-actions" aria-label="File actions">
+          <button id="filetree-open-folder" type="button" class="mode-button">Open Folder</button>
+          <button id="filetree-refresh" type="button" class="mode-button">Refresh</button>
+          <button id="filetree-new-file" type="button" class="mode-button">New File</button>
+          <button id="filetree-new-folder" type="button" class="mode-button">New Folder</button>
+          <button id="filetree-rename" type="button" class="mode-button" disabled>Rename</button>
+          <button id="filetree-delete" type="button" class="mode-button mode-button-danger" disabled>Delete</button>
+        </div>
+        <div id="filetree-grants" class="permission-strip"></div>
         <div id="filetree" class="filetree"></div>
       </section>
 

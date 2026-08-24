@@ -18,6 +18,7 @@ cd "$ROOT"
 if pgrep -x "$PRODUCT" >/dev/null 2>&1; then
   pkill -x "$PRODUCT" || true
 fi
+pkill -f "gui/server.py" >/dev/null 2>&1 || true
 
 swift build -c debug
 

@@ -116,7 +116,31 @@ ACTIVE_MODEL: str = "qwen3:4b"   # change to any key in MODELS
 Or per-agent, in the GUI's Agent Hub page (each agent has its own Model
 dropdown), or at runtime in Python: `agent.swap_model("gemma3:1b")`.
 
-## 8. Stop everything
+## 8. Connect GitHub / use web search
+
+No terminal commands needed — both live in the capability bar above any
+composer (Home, Code chat, Agent Hub console):
+
+- **GitHub** — click the GitHub button, paste a [Personal Access
+  Token](https://github.com/settings/tokens/new) (`repo` scope covers read +
+  issues). Stored locally at `~/.qwen-harness/secrets.json` (chmod 600),
+  never in the browser or in this repo. The same token is used by the
+  Python agents' `github_status` / `github_list_repos` / `github_list_dir` /
+  `github_get_file` tools (read-only for now).
+- **Web search** — click the Web search button, type a query. Uses
+  DuckDuckGo's HTML search (no API key). Each result has an "Insert
+  summary →" button that scrapes the page and drops its text into whichever
+  composer you last focused. Agents can also call `web_search` / `scrape_url`
+  directly.
+
+To disconnect GitHub or check status from a terminal instead:
+
+```bash
+curl -s http://127.0.0.1:8420/api/github/status
+curl -s -X POST http://127.0.0.1:8420/api/github/disconnect
+```
+
+## 9. Stop everything
 
 ```bash
 pkill -f "gui/server.py"

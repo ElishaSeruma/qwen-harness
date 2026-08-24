@@ -66,7 +66,7 @@ class _ResultParser(HTMLParser):
 class _TextExtractor(HTMLParser):
     """Strips a page down to its readable text (drops script/style/nav noise)."""
 
-    SKIP_TAGS = {"script", "style", "noscript", "svg", "head"}
+    SKIP_TAGS = {"script", "style", "noscript", "svg", "head", "nav", "header", "footer", "aside", "form", "button"}
 
     def __init__(self):
         super().__init__()

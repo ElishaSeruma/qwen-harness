@@ -6,37 +6,82 @@
 
 const API = ''; // same-origin, server.py serves both the API and the static files
 
+async function readJsonResponse(res, fallback) {
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) {
+    const err = new Error(data.error || fallback || `request failed (${res.status})`);
+    Object.assign(err, data);
+    throw err;
+  }
+  return data;
+}
+
 export async function apiListDir(path) {
   const res = await fetch(`${API}/api/fs/list?path=${encodeURIComponent(path || '')}`);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || `list failed (${res.status})`);
-  return data;
+  return readJsonResponse(res, `list failed (${res.status})`);
 }
 export async function apiReadFile(path) {
   const res = await fetch(`${API}/api/fs/read?path=${encodeURIComponent(path)}`);
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `read failed (${res.status})`);
+    const err = new Error(data.error || `read failed (${res.status})`);
+    Object.assign(err, data);
+    throw err;
   }
   return res.text();
+}
+export async function apiFsGrants() {
+  const res = await fetch(`${API}/api/fs/grants`, { cache: 'no-store' });
+  return readJsonResponse(res, `grants failed (${res.status})`);
+}
+export async function apiFsGrant(path) {
+  const res = await fetch(`${API}/api/fs/grant`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  return readJsonResponse(res, `grant failed (${res.status})`);
 }
 export async function apiWriteFile(path, content) {
   const res = await fetch(`${API}/api/fs/write`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path, content }),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || `write failed (${res.status})`);
-  return data;
+  return readJsonResponse(res, `write failed (${res.status})`);
+}
+export async function apiCreateFile(path, content = '') {
+  const res = await fetch(`${API}/api/fs/touch`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, content }),
+  });
+  return readJsonResponse(res, `create file failed (${res.status})`);
+}
+export async function apiCreateDir(path) {
+  const res = await fetch(`${API}/api/fs/mkdir`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  return readJsonResponse(res, `create folder failed (${res.status})`);
+}
+export async function apiMovePath(path, dest) {
+  const res = await fetch(`${API}/api/fs/move`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, dest }),
+  });
+  return readJsonResponse(res, `rename failed (${res.status})`);
+}
+export async function apiDeletePath(path, recursive = false) {
+  const res = await fetch(`${API}/api/fs/delete`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, recursive }),
+  });
+  return readJsonResponse(res, `delete failed (${res.status})`);
 }
 export async function apiExec(command, cwd) {
   const res = await fetch(`${API}/api/exec`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ command, cwd }),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || `exec failed (${res.status})`);
-  return data;
+  return readJsonResponse(res, `exec failed (${res.status})`);
 }
 export async function apiHealth() {
   try {
@@ -46,15 +91,11 @@ export async function apiHealth() {
 }
 export async function apiWebSearch(query, maxResults = 5) {
   const res = await fetch(`${API}/api/web/search?q=${encodeURIComponent(query)}&max_results=${maxResults}`);
-  const data = await res.json();
-  if (!res.ok || data.error) throw new Error(data.error || `search failed (${res.status})`);
-  return data;
+  return readJsonResponse(res, `search failed (${res.status})`);
 }
 export async function apiWebScrape(url) {
   const res = await fetch(`${API}/api/web/scrape?url=${encodeURIComponent(url)}`);
-  const data = await res.json();
-  if (!res.ok || data.error) throw new Error(data.error || `scrape failed (${res.status})`);
-  return data;
+  return readJsonResponse(res, `scrape failed (${res.status})`);
 }
 export async function apiGithubStatus() {
   const res = await fetch(`${API}/api/github/status`);
@@ -65,9 +106,7 @@ export async function apiGithubConnect(token) {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ token }),
   });
-  const data = await res.json();
-  if (!res.ok || data.error) throw new Error(data.error || `connect failed (${res.status})`);
-  return data;
+  return readJsonResponse(res, `connect failed (${res.status})`);
 }
 export async function apiGithubDisconnect() {
   const res = await fetch(`${API}/api/github/disconnect`, { method: 'POST' });
@@ -75,9 +114,37 @@ export async function apiGithubDisconnect() {
 }
 export async function apiGithubRepos() {
   const res = await fetch(`${API}/api/github/repos`);
-  const data = await res.json();
-  if (!res.ok || data.error) throw new Error(data.error || `list repos failed (${res.status})`);
-  return data;
+  return readJsonResponse(res, `list repos failed (${res.status})`);
+}
+
+const desktopPending = new Map();
+window.__qhDesktopResolve = (id, payload) => {
+  const pending = desktopPending.get(id);
+  if (!pending) return;
+  desktopPending.delete(id);
+  if (payload?.ok) pending.resolve(payload);
+  else pending.reject(Object.assign(new Error(payload?.cancelled ? 'cancelled' : (payload?.error || 'desktop action failed')), payload));
+};
+
+export function isDesktopClient() {
+  return Boolean(window.webkit?.messageHandlers?.desktop);
+}
+
+export function desktopChooseDirectory() {
+  return desktopAction('chooseDirectory');
+}
+
+export function desktopChooseFile() {
+  return desktopAction('chooseFile');
+}
+
+function desktopAction(action) {
+  if (!isDesktopClient()) return Promise.reject(new Error('desktop bridge unavailable'));
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return new Promise((resolve, reject) => {
+    desktopPending.set(id, { resolve, reject });
+    window.webkit.messageHandlers.desktop.postMessage({ id, action });
+  });
 }
 
 // ── persisted state ─────────────────────────────────────────────────────
