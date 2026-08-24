@@ -4,90 +4,242 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Qwen Harness · Control Room</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
 <div class="app">
 
-  <header class="topbar">
-    <div class="brand">
-      <span class="brand-dot" aria-hidden="true"></span>
-      <div>
-        <p class="eyebrow">qwen-harness</p>
-        <h1>Control Room</h1>
-      </div>
+  <aside class="rail">
+    <div class="rail-brand">
+      <span class="rail-dot" aria-hidden="true"></span>
     </div>
-    <div class="topbar-status">
-      <span class="status-pill" id="ollama-status" data-state="checking">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span id="ollama-status-label">Checking Ollama…</span>
-      </span>
-      <span class="status-pill" id="model-status" data-state="checking">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span id="model-status-label">config.py: —</span>
-      </span>
-    </div>
-  </header>
+    <nav class="rail-nav" id="rail-nav">
+      <button class="rail-link is-active" type="button" data-route="home">
+        <span class="rail-icon" aria-hidden="true">⌂</span>
+        <span>Home</span>
+      </button>
+      <button class="rail-link" type="button" data-route="code">
+        <span class="rail-icon" aria-hidden="true">&lt;/&gt;</span>
+        <span>Code</span>
+      </button>
+      <button class="rail-link" type="button" data-route="hub">
+        <span class="rail-icon" aria-hidden="true">◈</span>
+        <span>Agent hub</span>
+      </button>
+    </nav>
+    <button class="rail-theme" id="theme-toggle" type="button" title="Toggle dark mode">
+      <span id="theme-icon">◐</span>
+    </button>
+  </aside>
 
-  <main class="workspace">
+  <div class="shell">
 
-    <section class="panel roster" aria-label="Agent roster">
-      <div class="panel-head">
-        <h2>Agents</h2>
-        <p class="panel-copy">One avatar per agent. State follows the tool-use loop live.</p>
+    <header class="topbar">
+      <div class="brand">
+        <p class="eyebrow" id="route-eyebrow">qwen-harness</p>
+        <h1 id="route-title">Home</h1>
       </div>
-      <div id="roster-list" class="roster-list"></div>
-      <button id="add-agent" class="ghost-button" type="button">+ Add agent</button>
-    </section>
-
-    <section class="panel stage" aria-label="Selected agent">
-      <div class="panel-head stage-head">
-        <div>
-          <h2 id="stage-name">—</h2>
-          <p class="panel-copy" id="stage-model">—</p>
-        </div>
-        <span class="status-pill" id="stage-state" data-state="idle">
+      <div class="topbar-status">
+        <span class="status-pill" id="backend-status" data-state="checking">
           <span class="status-dot" aria-hidden="true"></span>
-          <span id="stage-state-label">idle</span>
+          <span id="backend-status-label">Checking server…</span>
+        </span>
+        <span class="status-pill" id="ollama-status" data-state="checking">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="ollama-status-label">Checking Ollama…</span>
+        </span>
+        <span class="status-pill" id="model-status" data-state="checking">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="model-status-label">config.py: —</span>
         </span>
       </div>
-      <div class="stage-avatar" id="stage-avatar"></div>
-      <div class="stage-controls">
-        <label class="field">
-          <span>Avatar</span>
-          <select id="avatar-picker"></select>
-        </label>
-        <label class="field">
-          <span>State</span>
-          <select id="state-picker"></select>
-        </label>
-        <label class="field">
-          <span>Model</span>
-          <select id="model-picker"></select>
-        </label>
-      </div>
-    </section>
+    </header>
 
-    <section class="panel console" aria-label="Run console">
+    <!-- ── HOME ─────────────────────────────────────────────────────── -->
+    <main class="home-view view" id="view-home">
+
+      <div class="home-greeting">
+        <p class="home-eyebrow" id="home-date">—</p>
+        <h1 id="home-greeting-text">Good day</h1>
+        <p class="home-sub">Pass instructions to your agents.</p>
+      </div>
+
+      <div class="composer-shell" id="home-composer-shell">
+        <div class="capability-bar" id="home-capbar"></div>
+        <textarea id="home-composer-input" class="composer-textarea" rows="3" placeholder="Type an instruction…"></textarea>
+        <div id="home-attachment-list" class="attachment-list"></div>
+        <div class="composer-toolbar">
+          <label class="field field-inline">
+            <span>Send to</span>
+            <select id="home-agent-target"></select>
+          </label>
+          <label class="field field-inline">
+            <span>Model</span>
+            <select id="home-model-select"></select>
+          </label>
+          <button id="home-send" type="button" class="send-button">Send →</button>
+        </div>
+      </div>
+
+      <div class="home-feed" id="home-feed">
+        <p class="transcript-empty">Responses from the agent(s) you message will appear here.</p>
+      </div>
+
+    </main>
+
+    <!-- ── CODE ─────────────────────────────────────────────────────── -->
+    <main class="workspace-code view" id="view-code" hidden>
+
+      <section class="panel filetree-panel" id="code-tree-panel" aria-label="Directory browser">
+        <div class="panel-head filetree-head">
+          <div>
+            <h2>Files</h2>
+            <p class="panel-copy">Browse any directory on this Mac.</p>
+          </div>
+          <button class="minimize-btn" id="filetree-minimize" type="button" title="Minimize">«</button>
+        </div>
+        <div class="filetree-path-row">
+          <input id="filetree-path" type="text" class="path-input" placeholder="/Users/you/some/project" />
+          <button id="filetree-go" type="button" class="mode-button">Go</button>
+        </div>
+        <div id="filetree" class="filetree"></div>
+      </section>
+
+      <section class="panel code-panel" aria-label="Code editor">
+        <div class="panel-head code-panel-head">
+          <h2 id="code-file-name">Select a file</h2>
+          <div class="code-panel-actions">
+            <span class="status-pill" id="code-file-status" data-state="off">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span id="code-file-status-label">no file open</span>
+            </span>
+            <button class="mode-button" id="code-save" type="button" disabled>Save</button>
+          </div>
+        </div>
+        <textarea id="code-editor" class="code-editor" spellcheck="false" placeholder="// Pick a file from the tree on the left."></textarea>
+      </section>
+
+      <section class="panel code-side-panel" aria-label="Terminal, browser preview and chat">
+        <div class="capability-bar" id="code-capbar"></div>
+        <div class="code-tabs" id="code-tabs">
+          <button class="code-tab is-active" type="button" data-tab="chat">Chat</button>
+          <button class="code-tab" type="button" data-tab="terminal">Terminal</button>
+          <button class="code-tab" type="button" data-tab="browser">Browser</button>
+        </div>
+
+        <div class="code-tab-panel" id="tab-chat">
+          <div class="transcript" id="code-transcript">
+            <p class="transcript-empty">Ask about a file, or paste a snippet. This chat is saved in your browser.</p>
+          </div>
+          <form class="composer" id="code-composer">
+            <input id="code-composer-input" type="text" placeholder="Ask about the code…" autocomplete="off" />
+            <button type="submit">Send</button>
+          </form>
+        </div>
+
+        <div class="code-tab-panel" id="tab-terminal" hidden>
+          <div class="transcript terminal-output" id="terminal-output"></div>
+          <form class="composer" id="terminal-composer">
+            <input id="terminal-input" type="text" placeholder="$ command" autocomplete="off" />
+            <button type="submit">Run</button>
+          </form>
+        </div>
+
+        <div class="code-tab-panel" id="tab-browser" hidden>
+          <form class="composer" id="browser-preview-form">
+            <input id="browser-preview-url" type="text" placeholder="http://localhost:3000" autocomplete="off" />
+            <button type="submit">Go</button>
+          </form>
+          <iframe id="browser-preview-frame" class="browser-preview-frame" title="Browser preview"></iframe>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- ── AGENT HUB ────────────────────────────────────────────────── -->
+    <main class="hub view" id="view-hub" hidden>
       <div class="panel-head">
-        <h2>Console</h2>
-        <p class="panel-copy" id="mode-copy">Demo mode — scripted, no model calls. Swap to Live once a model has finished downloading.</p>
+        <h2>Agent hub</h2>
+        <p class="panel-copy">Every agent, its avatar and its assignment in one place. Rename anything.</p>
       </div>
-      <div class="run-buttons" id="run-buttons"></div>
-      <div class="mode-toggle">
-        <button class="mode-button is-active" id="mode-demo" type="button">Demo mode</button>
-        <button class="mode-button" id="mode-live" type="button">Live mode</button>
-      </div>
-      <div class="transcript" id="transcript">
-        <p class="transcript-empty">Pick a script above to preview a run, or switch to Live mode once Ollama has a model ready.</p>
-      </div>
-      <form class="composer" id="composer">
-        <input id="composer-input" type="text" placeholder="Message the selected agent…" autocomplete="off" />
-        <button type="submit">Send</button>
-      </form>
-    </section>
+      <div class="hub-grid" id="hub-grid"></div>
+      <button id="hub-add-agent" class="ghost-button hub-add" type="button">+ New agent</button>
 
-  </main>
+      <div class="hub-console">
+        <button class="hub-console-toggle" id="hub-console-toggle" type="button">
+          <span id="hub-console-caret">▸</span> Console — run scripted or live conversations
+        </button>
+        <div class="hub-console-body" id="hub-console-body" hidden>
+          <label class="field field-inline hub-console-focus">
+            <span>Focus agent</span>
+            <select id="hub-focus-agent"></select>
+          </label>
+          <div class="workspace">
+            <section class="panel stage" aria-label="Selected agent">
+              <div class="panel-head stage-head">
+                <div>
+                  <h2 id="stage-name">—</h2>
+                  <p class="panel-copy" id="stage-model">—</p>
+                </div>
+                <span class="status-pill" id="stage-state" data-state="idle">
+                  <span class="status-dot" aria-hidden="true"></span>
+                  <span id="stage-state-label">idle</span>
+                </span>
+              </div>
+              <div class="stage-avatar" id="stage-avatar"></div>
+              <div class="stage-controls">
+                <label class="field">
+                  <span>Avatar</span>
+                  <select id="avatar-picker"></select>
+                </label>
+                <label class="field">
+                  <span>State</span>
+                  <select id="state-picker"></select>
+                </label>
+                <label class="field">
+                  <span>Model</span>
+                  <select id="model-picker"></select>
+                </label>
+              </div>
+            </section>
+
+            <section class="panel console" aria-label="Run console">
+              <div class="panel-head">
+                <h2>Console</h2>
+                <p class="panel-copy" id="mode-copy">Demo mode — scripted, no model calls.</p>
+              </div>
+              <div class="run-buttons" id="run-buttons"></div>
+              <div class="mode-toggle">
+                <button class="mode-button is-active" id="mode-demo" type="button">Demo mode</button>
+                <button class="mode-button" id="mode-live" type="button">Live mode</button>
+              </div>
+              <div class="transcript" id="transcript">
+                <p class="transcript-empty">Pick a script above to preview a run, or switch to Live mode.</p>
+              </div>
+              <div class="capability-bar" id="hub-capbar"></div>
+              <form class="composer" id="composer">
+                <input id="composer-input" type="text" placeholder="Message the selected agent…" autocomplete="off" />
+                <button type="submit">Send</button>
+              </form>
+            </section>
+          </div>
+        </div>
+      </div>
+    </main>
+
+  </div>
+</div>
+
+<!-- ── shared capability drawer (bottom sheet, one instance for the whole app) ── -->
+<div class="cap-drawer" id="cap-drawer" hidden>
+  <div class="cap-drawer-head">
+    <span id="cap-drawer-title">Panel</span>
+    <button class="cap-drawer-close" id="cap-drawer-close" type="button">×</button>
+  </div>
+  <div class="cap-drawer-body" id="cap-drawer-body"></div>
 </div>
 
 <script type="module" src="app.js"></script>

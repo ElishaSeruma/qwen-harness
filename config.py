@@ -22,37 +22,40 @@ class ModelConfig:
 
 # ── Local models (via Ollama) ─────────────────────────────────────────────────
 # Install: ollama pull <name>
+# This is the harness's canonical light-model roster for 8 GB Macs — one
+# primary model (qwen3:4b) plus four very light options for sub-agents that
+# just route, extract, or do narrow tool-calling in orchestrator.py.
 # Apple Silicon RAM guide:
-#   8B  → needs ~5 GB  → safe on 8 GB Mac
-#  14B  → needs ~9 GB  → good on 16 GB Mac
-#  30B  → needs ~20 GB → good on 32 GB Mac (MoE: only 3B active per token)
+#  0.6B/1B  → needs ~1 GB   → trivial on any Mac
+#   2B      → needs ~2 GB   → safe on 8 GB Mac
+#   4B      → needs ~3 GB   → safe on 8 GB Mac
 MODELS: dict[str, ModelConfig] = {
 
-    # ── Qwen3 local ───────────────────────────────────────────
-    "qwen3:8b": ModelConfig(
-        name="qwen3:8b",
-        base_url="http://localhost:11434/v1",
-        api_key="ollama",
-    ),
-    "qwen3:14b": ModelConfig(
-        name="qwen3:14b",
-        base_url="http://localhost:11434/v1",
-        api_key="ollama",
-    ),
-    "qwen3:30b-a3b": ModelConfig(  # MoE – fastest large model on Mac
-        name="qwen3:30b-a3b",
+    # ── Primary ─────────────────────────────────────────────────
+    "qwen3:4b": ModelConfig(
+        name="qwen3:4b",
         base_url="http://localhost:11434/v1",
         api_key="ollama",
     ),
 
-    # ── DeepSeek local ────────────────────────────────────────
-    "deepseek-r1:8b": ModelConfig(
-        name="deepseek-r1:8b",
+    # ── Light agents (routing / tool-calling / sub-agents) ────────
+    "qwen3:0.6b": ModelConfig(
+        name="qwen3:0.6b",
         base_url="http://localhost:11434/v1",
         api_key="ollama",
     ),
-    "deepseek-r1:14b": ModelConfig(
-        name="deepseek-r1:14b",
+    "gemma3:1b": ModelConfig(
+        name="gemma3:1b",
+        base_url="http://localhost:11434/v1",
+        api_key="ollama",
+    ),
+    "llama3.2:1b": ModelConfig(
+        name="llama3.2:1b",
+        base_url="http://localhost:11434/v1",
+        api_key="ollama",
+    ),
+    "gemma2:2b": ModelConfig(
+        name="gemma2:2b",
         base_url="http://localhost:11434/v1",
         api_key="ollama",
     ),
@@ -74,7 +77,7 @@ MODELS: dict[str, ModelConfig] = {
 
 # ── Active model ──────────────────────────────────────────────────────────────
 # Change this one line to switch all agents globally.
-ACTIVE_MODEL: str = "qwen3:14b"
+ACTIVE_MODEL: str = "qwen3:4b"
 
 
 def get_config(key: Optional[str] = None) -> ModelConfig:

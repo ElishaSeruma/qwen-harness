@@ -1,27 +1,33 @@
 {
-  "active": "qwen3:14b",
+  "active": "qwen3:4b",
   "models": [
     {
-      "key": "qwen3:8b",
-      "name": "qwen3:8b",
+      "key": "qwen3:4b",
+      "name": "qwen3:4b",
       "base_url": "http://localhost:11434/v1",
       "local": true
     },
     {
-      "key": "qwen3:14b",
-      "name": "qwen3:14b",
+      "key": "qwen3:0.6b",
+      "name": "qwen3:0.6b",
       "base_url": "http://localhost:11434/v1",
       "local": true
     },
     {
-      "key": "deepseek-r1:8b",
-      "name": "deepseek-r1:8b",
+      "key": "gemma3:1b",
+      "name": "gemma3:1b",
       "base_url": "http://localhost:11434/v1",
       "local": true
     },
     {
-      "key": "deepseek-r1:14b",
-      "name": "deepseek-r1:14b",
+      "key": "llama3.2:1b",
+      "name": "llama3.2:1b",
+      "base_url": "http://localhost:11434/v1",
+      "local": true
+    },
+    {
+      "key": "gemma2:2b",
+      "name": "gemma2:2b",
       "base_url": "http://localhost:11434/v1",
       "local": true
     },

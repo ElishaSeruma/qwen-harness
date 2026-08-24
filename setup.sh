@@ -24,13 +24,25 @@ else
 fi
 
 echo ""
-echo "── 3. Pulling Qwen3 models ─────────────────────────────"
-echo "Pulling qwen3:8b  (~5 GB – works on 8 GB RAM Macs)"
-ollama pull qwen3:8b
+echo "── 3. Pulling the light model roster (8 GB RAM friendly) ──"
+echo "Pulling qwen3:4b     (~2.5 GB – primary model)"
+ollama pull qwen3:4b
 
 echo ""
-echo "Pulling qwen3:14b (~9 GB – recommended for 16 GB+ RAM)"
-ollama pull qwen3:14b
+echo "Pulling qwen3:0.6b   (~0.5 GB – lightest agent)"
+ollama pull qwen3:0.6b
+
+echo ""
+echo "Pulling gemma3:1b    (~0.8 GB – light agent)"
+ollama pull gemma3:1b
+
+echo ""
+echo "Pulling llama3.2:1b  (~1.3 GB – light agent)"
+ollama pull llama3.2:1b
+
+echo ""
+echo "Pulling gemma2:2b    (~1.6 GB – light agent)"
+ollama pull gemma2:2b
 
 echo ""
 echo "── 4. Python dependencies ──────────────────────────────"

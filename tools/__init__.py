@@ -256,6 +256,93 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+
+    # ── Web search / scraping ─────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web and return the top results (title, url, snippet).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "integer", "description": "Max results to return (default 5)"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scrape_url",
+            "description": "Fetch a URL and return its readable text content (HTML stripped).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to fetch"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+
+    # ── GitHub (read-only; connect via the GUI's Connectors panel) ──
+    {
+        "type": "function",
+        "function": {
+            "name": "github_status",
+            "description": "Check whether GitHub is connected, and which account.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "github_list_repos",
+            "description": "List repositories the connected GitHub account owns or collaborates on.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_results": {"type": "integer", "description": "Max repos to return (default 30)"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "github_list_dir",
+            "description": "List a directory's contents in a GitHub repo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "path": {"type": "string", "description": "Directory path (empty for repo root)"},
+                },
+                "required": ["owner", "repo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "github_get_file",
+            "description": "Read a file's contents from a GitHub repo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["owner", "repo", "path"],
+            },
+        },
+    },
 ]
 
 
@@ -317,6 +404,28 @@ def execute_tool(name: str, args: dict[str, Any]) -> Any:
         elif name == "run_shell":
             from tools.files import run_shell
             return run_shell(**args)
+
+        # Web tools
+        elif name == "web_search":
+            from tools.web import web_search
+            return web_search(**args)
+        elif name == "scrape_url":
+            from tools.web import scrape_url
+            return scrape_url(**args)
+
+        # GitHub tools
+        elif name == "github_status":
+            from tools.github import gh_status
+            return gh_status()
+        elif name == "github_list_repos":
+            from tools.github import gh_list_repos
+            return gh_list_repos(**args)
+        elif name == "github_list_dir":
+            from tools.github import gh_list_dir
+            return gh_list_dir(**args)
+        elif name == "github_get_file":
+            from tools.github import gh_get_file
+            return gh_get_file(**args)
 
         else:
             return {"error": f"Unknown tool: {name}"}
