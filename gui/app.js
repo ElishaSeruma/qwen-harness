@@ -330,7 +330,7 @@ async function renderActivityDrawer(prefetched = null) {
   for (const run of runs) {
     const card = document.createElement('article'); card.className = 'run-card'; card.dataset.runId = run.id;
     const head = document.createElement('div'); head.className = 'run-card-head';
-    head.append(createActivityIndicator(run.status, { size: 20, detail: run.events?.at(-1)?.type || run.surface }));
+    head.append(createActivityIndicator(run.status, { size: 20, detail: run.last_event_type || run.events?.at(-1)?.type || run.surface }));
     const effortNames = ['Quick', 'Focus', 'Deep', 'Max'];
     const meta = document.createElement('span'); meta.className = 'run-card-meta'; meta.textContent = `${effortNames[(run.effort_level || 1) - 1]} ${run.effort_level || 1}/4 · #${run.attempt || 1} · ${relativeRunTime(run.updated_at)}`; head.append(meta);
     const instruction = document.createElement('p'); instruction.className = 'run-card-instruction'; instruction.textContent = run.instruction || '(no instruction)';

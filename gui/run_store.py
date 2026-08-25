@@ -56,12 +56,38 @@ class RunStore:
     def _find(self, run_id: str) -> dict[str, Any] | None:
         return next((run for run in self._runs if run.get("id") == run_id), None)
 
-    def list(self, project_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    def list(
+        self,
+        project_id: str | None = None,
+        limit: int = 50,
+        include_events: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Runs, newest first.
+
+        Events are summarized by default. Each run can carry up to 500 events,
+        so embedding them made the polled list response ~22KB and forced a
+        deep-copy of all of it while holding the lock (blocking every writer,
+        including live event appends). The activity drawer only ever needed
+        the last event's type. Full history stays available via get() and the
+        /api/runs/events endpoint, or by passing include_events=True.
+        """
         with self.lock:
             rows = self._runs
             if project_id:
                 rows = [run for run in rows if run.get("project_id") == project_id]
-            return copy.deepcopy(list(reversed(rows[-max(1, min(limit, 200)):])) )
+            selected = list(reversed(rows[-max(1, min(limit, 200)):]))
+            if include_events:
+                return copy.deepcopy(selected)
+            summaries = []
+            for run in selected:
+                events = run.get("events") or []
+                last = events[-1] if events else None
+                summary = {k: v for k, v in run.items() if k != "events"}
+                summary = copy.deepcopy(summary)
+                summary["last_event_type"] = last.get("type") if last else None
+                summary["event_count"] = len(events)
+                summaries.append(summary)
+            return summaries
 
     def get(self, run_id: str) -> dict[str, Any] | None:
         with self.lock:

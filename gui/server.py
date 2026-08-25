@@ -784,7 +784,9 @@ class Handler(BaseHTTPRequestHandler):
             limit = int(query.get('limit', ['50'])[0])
         except ValueError:
             limit = 50
-        self._send_json({'runs': RUN_STORE.list(project_id=project_id, limit=limit)})
+        include_events = query.get('include_events', ['0'])[0] not in ('0', '', 'false')
+        runs = RUN_STORE.list(project_id=project_id, limit=limit, include_events=include_events)
+        self._send_json({'runs': runs})
 
     def _handle_run_get(self, run_id):
         from gui.run_store import RUN_STORE
