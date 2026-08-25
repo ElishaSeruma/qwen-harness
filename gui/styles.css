@@ -141,6 +141,15 @@ h1 { margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -0.01em; }
 .services-step { margin: 14px 0 10px; font: 700 11px var(--font-mono); color: var(--muted-foreground); }
 .services-run { width: 100%; min-height: 34px; margin-bottom: 12px; border: 2px solid var(--border); background: var(--foreground); color: var(--background); font: 700 11px var(--font-mono); cursor: pointer; }
 .services-run:disabled { background: var(--card); color: var(--muted-foreground); cursor: not-allowed; }
+.services-models { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.services-models:empty { display: none; }
+.services-models li { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border: 2px solid var(--border); background: var(--card); font: 700 11px var(--font-mono); }
+.services-models .sm-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.services-models .sm-detail { color: var(--muted-foreground); font-weight: 400; }
+.services-models li[data-state="ready"] .status-dot { background: var(--chart-4); }
+.services-models li[data-state="pulling"] .status-dot { background: currentColor; animation: pulse 1.2s ease-in-out infinite; }
+.services-models li[data-state="missing"] .status-dot { background: var(--muted-foreground); }
+.services-models li[data-state="failed"] .status-dot { background: var(--primary); }
 .services-log {
   margin: 0; padding: 10px; max-height: calc(100vh - 220px); overflow: auto;
   border: 2px solid var(--border); background: var(--card); color: var(--card-foreground);

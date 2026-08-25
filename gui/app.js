@@ -3256,6 +3256,25 @@ const SERVICES_LABELS = {
   failed: 'Services failed',
 };
 
+function renderServiceModels(models, activeModel) {
+  const list = $('#services-models');
+  list.replaceChildren();
+  for (const m of models) {
+    const li = document.createElement('li');
+    li.dataset.state = m.state;
+    const dot = document.createElement('span');
+    dot.className = 'status-dot'; dot.setAttribute('aria-hidden', 'true');
+    const name = document.createElement('span');
+    name.className = 'sm-name';
+    name.textContent = m.name === activeModel ? `${m.name} ★` : m.name;
+    const detail = document.createElement('span');
+    detail.className = 'sm-detail';
+    detail.textContent = m.detail || m.state;
+    li.append(dot, name, detail);
+    list.append(li);
+  }
+}
+
 function renderServices(status) {
   const btn = $('#services-toggle');
   const state = status?.state || 'idle';
@@ -3273,6 +3292,8 @@ function renderServices(status) {
   else if (state === 'done') step.textContent = status.active_model ? `Ready · ACTIVE_MODEL ${status.active_model}` : 'Ready.';
   else if (state === 'failed') step.textContent = status.error || 'Failed.';
   else step.textContent = 'Not started.';
+
+  renderServiceModels(status?.models || [], status?.active_model);
 
   const log = $('#services-log');
   if (status?.log?.length) {

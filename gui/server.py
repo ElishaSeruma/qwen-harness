@@ -36,8 +36,8 @@ static frontend cannot do on its own:
   GET  /api/tools/list                       -> the same TOOL_DEFINITIONS the Python agents use
   POST /api/tools/call  {name, args}         -> execute one tool, for the GUI's chat tool-loop
   GET  /api/system/stats                     -> resource monitor: per-loaded-model + system CPU/RAM
-  POST /api/services/start                   -> run setup.sh then config.py in the background
-  GET  /api/services/status                  -> {state, step, log[]} for that background job
+  POST /api/services/start                   -> start ollama, pull only missing models, read config.py
+  GET  /api/services/status                  -> {state, step, models[], active_model, log[]}
   GET  /api/supabase/status                  -> {connected, url} (never the key)
   POST /api/supabase/connect {url, service_role_key} -> validate + store Supabase creds locally
   POST /api/supabase/disconnect              -> forget stored Supabase creds
@@ -69,6 +69,7 @@ import uuid
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import urllib.request
 from urllib.parse import urlparse, parse_qs, unquote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -142,23 +143,37 @@ CONTENT_TYPES = {
 }
 
 # ── "Start services" job ──────────────────────────────────────────────────
-# setup.sh pulls ~7 GB of models and installs pip/playwright deps, so it runs
-# for many minutes — far past EXEC_TIMEOUT_S. It therefore runs in a background
-# thread that streams its output into a bounded log buffer, and the GUI polls
-# /api/services/status instead of holding a request open.
+# Brings the stack up and reports what is ready. Deliberately NOT setup.sh:
+# that is a first-run installer which re-pulls every model and reinstalls pip
+# deps on every invocation. Starting services means (1) make sure ollama is
+# listening, (2) make sure the roster in config.py is present — pulling only
+# what is genuinely missing, (3) report the active model. A machine that is
+# already provisioned finishes this in well under a second and downloads
+# nothing.
 SERVICES_LOCK = threading.RLock()
 SERVICES_LOG_LINES = 400   # ring buffer; the GUI only ever shows a tail
-SERVICES_STEPS = ('setup.sh', 'config.py')
-SERVICES_STATE = {
-    'state': 'idle',       # idle | running | done | failed
-    'step': None,          # which of SERVICES_STEPS is executing
-    'started_at': None,
-    'finished_at': None,
-    'code': None,          # exit code of the failing/last step
-    'error': None,
-    'active_model': None,  # ACTIVE_MODEL, as reported by config.py
-    'log': [],
-}
+SERVICES_STEPS = ('ollama', 'models', 'config.py')
+OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434').rstrip('/')
+if not OLLAMA_HOST.startswith('http'):
+    OLLAMA_HOST = f'http://{OLLAMA_HOST}'
+OLLAMA_BOOT_TIMEOUT_S = 30
+
+
+def _blank_services_state():
+    return {
+        'state': 'idle',       # idle | running | done | failed
+        'step': None,          # which of SERVICES_STEPS is executing
+        'started_at': None,
+        'finished_at': None,
+        'error': None,
+        'ollama': None,        # 'running' | 'started' | 'unavailable'
+        'active_model': None,  # ACTIVE_MODEL, as reported by config.py
+        'models': [],          # [{name, state, detail}] — drives the GUI's model status list
+        'log': [],
+    }
+
+
+SERVICES_STATE = _blank_services_state()
 
 
 def _services_log(line):
@@ -168,58 +183,173 @@ def _services_log(line):
             del SERVICES_STATE['log'][:-SERVICES_LOG_LINES]
 
 
-def _services_run_step(step, argv):
-    """Run one step, streaming stdout+stderr into the log. Returns exit code."""
+def _services_set_step(step):
     with SERVICES_LOCK:
         SERVICES_STATE['step'] = step
-    _services_log(f'── {step} ──────────────────────────────────────')
+    _services_log(f'── {step} ──')
+
+
+def _services_set_model(name, state, detail=''):
+    """Upsert one row of the model status table."""
+    with SERVICES_LOCK:
+        for row in SERVICES_STATE['models']:
+            if row['name'] == name:
+                row.update(state=state, detail=detail)
+                return
+        SERVICES_STATE['models'].append({'name': name, 'state': state, 'detail': detail})
+
+
+def _ollama_tags():
+    """Installed model names, or None if ollama isn't answering."""
     try:
-        proc = subprocess.Popen(
-            argv, cwd=str(REPO_ROOT), stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1,
+        with urllib.request.urlopen(f'{OLLAMA_HOST}/api/tags', timeout=3) as res:
+            data = json.load(res)
+        return {m['name'] for m in data.get('models', [])}
+    except Exception:
+        return None
+
+
+def _services_start_ollama():
+    """Ensure ollama is listening. Returns 'running' | 'started' | 'unavailable'."""
+    if _ollama_tags() is not None:
+        _services_log(f'Ollama already listening on {OLLAMA_HOST}')
+        return 'running'
+    if not shutil.which('ollama'):
+        _services_log('! ollama binary not found on PATH — install it first (brew install ollama)')
+        return 'unavailable'
+    _services_log('Ollama not responding — starting `ollama serve`…')
+    try:
+        # Detached and fully redirected: this outlives the request, and must not
+        # inherit our pipes or it would block once nobody drains them.
+        subprocess.Popen(
+            ['ollama', 'serve'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True,
         )
     except OSError as exc:
-        _services_log(f'! could not start {step}: {exc}')
-        return 127
-    for line in proc.stdout:
-        _services_log(line.rstrip('\n'))
-    return proc.wait()
+        _services_log(f'! could not start ollama: {exc}')
+        return 'unavailable'
+    deadline = time.time() + OLLAMA_BOOT_TIMEOUT_S
+    while time.time() < deadline:
+        if _ollama_tags() is not None:
+            _services_log('Ollama started')
+            return 'started'
+        time.sleep(0.5)
+    _services_log(f'! ollama did not come up within {OLLAMA_BOOT_TIMEOUT_S}s')
+    return 'unavailable'
 
 
-# config.py is a module of constants, not a CLI — executing it plainly prints
-# nothing. runpy executes it exactly as a script would and then lets us report
-# the registry it defines, which is the part that is actually worth seeing.
-_CONFIG_RUNNER = (
-    'import runpy;'
-    'ns = runpy.run_path("config.py");'
-    'print("ACTIVE_MODEL=" + ns["ACTIVE_MODEL"]);'
-    'print("models: " + ", ".join(ns["MODELS"]))'
-)
+def _local_roster():
+    """Local (Ollama-backed) model names from config.py, in declaration order."""
+    script = (
+        'import json, runpy;'
+        'ns = runpy.run_path("config.py");'
+        'print(json.dumps({'
+        '"active": ns["ACTIVE_MODEL"],'
+        '"local": [k for k, c in ns["MODELS"].items() if "localhost" in c.base_url or "127.0.0.1" in c.base_url]'
+        '}))'
+    )
+    proc = subprocess.run([sys.executable, '-c', script], cwd=str(REPO_ROOT),
+                          capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or 'config.py failed').strip().splitlines()[-1])
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _pull_model(name):
+    """Pull one model via the HTTP API. Returns True on success.
+
+    Uses /api/pull rather than `ollama pull` because the CLI renders an ANSI
+    spinner and redraws progress with cursor-control escapes — piped into a
+    log buffer that arrives as unreadable garbage. The API streams plain JSON.
+    """
+    body = json.dumps({'model': name, 'stream': True}).encode()
+    req = urllib.request.Request(f'{OLLAMA_HOST}/api/pull', data=body,
+                                 headers={'Content-Type': 'application/json'})
+    last_pct = -1
+    try:
+        with urllib.request.urlopen(req, timeout=3600) as res:
+            for raw in res:
+                if not raw.strip():
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                if msg.get('error'):
+                    _services_log(f'  ! {name}: {msg["error"]}')
+                    _services_set_model(name, 'failed', msg['error'])
+                    return False
+                total, done = msg.get('total'), msg.get('completed')
+                if total and done:
+                    pct = int(done * 100 / total)
+                    # Only log every 10% — a per-chunk log would blow the ring
+                    # buffer and hide everything else.
+                    if pct >= last_pct + 10:
+                        last_pct = pct
+                        _services_log(f'  {name}: {pct}%')
+                        _services_set_model(name, 'pulling', f'{pct}%')
+        _services_log(f'  {name}: pulled')
+        _services_set_model(name, 'ready', 'just pulled')
+        return True
+    except Exception as exc:
+        _services_log(f'  ! {name}: {exc}')
+        _services_set_model(name, 'failed', str(exc))
+        return False
+
+
+def _services_check_models():
+    """Report every rostered model; pull only the ones actually missing."""
+    roster = _local_roster()
+    installed = _ollama_tags() or set()
+    missing = []
+    for name in roster['local']:
+        # `ollama list` reports bare names and ":latest" interchangeably.
+        if name in installed or f'{name}:latest' in installed:
+            _services_log(f'  {name}: ready')
+            _services_set_model(name, 'ready', 'already installed')
+        else:
+            _services_log(f'  {name}: missing — will pull')
+            _services_set_model(name, 'missing', 'not installed')
+            missing.append(name)
+    if not missing:
+        _services_log(f'All {len(roster["local"])} rostered models already present — nothing to download.')
+        return True
+    _services_log(f'Pulling {len(missing)} missing model(s): {", ".join(missing)}')
+    return all([_pull_model(name) for name in missing])
 
 
 def _services_worker():
     try:
-        for step in SERVICES_STEPS:
-            argv = ['bash', 'setup.sh'] if step == 'setup.sh' else [sys.executable, '-c', _CONFIG_RUNNER]
-            code = _services_run_step(step, argv)
-            if code != 0:
-                with SERVICES_LOCK:
-                    SERVICES_STATE.update(state='failed', code=code,
-                                          error=f'{step} exited with code {code}')
-                _services_log(f'✗ {step} failed (exit {code})')
-                return
-            if step == 'config.py':
-                active = next((l.split('=', 1)[1] for l in reversed(SERVICES_STATE['log'])
-                               if l.startswith('ACTIVE_MODEL=')), None)
-                with SERVICES_LOCK:
-                    SERVICES_STATE['active_model'] = active
+        _services_set_step('ollama')
+        ollama = _services_start_ollama()
         with SERVICES_LOCK:
-            SERVICES_STATE.update(state='done', code=0, step=None)
-        _services_log('✅ services started')
-    except Exception as exc:  # a worker thread dying silently would hang the pill on "running"
+            SERVICES_STATE['ollama'] = ollama
+        if ollama == 'unavailable':
+            raise RuntimeError('Ollama is not available — start it, then try again.')
+
+        _services_set_step('models')
+        models_ok = _services_check_models()
+
+        _services_set_step('config.py')
+        roster = _local_roster()
+        active = roster['active']
+        with SERVICES_LOCK:
+            SERVICES_STATE['active_model'] = active
+        installed = _ollama_tags() or set()
+        _services_log(f'ACTIVE_MODEL = {active}')
+        if active not in installed and f'{active}:latest' not in installed:
+            raise RuntimeError(f'active model {active} is not installed')
+        if not models_ok:
+            raise RuntimeError('some models failed to pull — see the log')
+
+        with SERVICES_LOCK:
+            SERVICES_STATE.update(state='done', step=None)
+        _services_log(f'✅ services ready · {active}')
+    except Exception as exc:
         with SERVICES_LOCK:
             SERVICES_STATE.update(state='failed', error=str(exc))
-        _services_log(f'! {exc}')
+        _services_log(f'✗ {exc}')
     finally:
         with SERVICES_LOCK:
             SERVICES_STATE['finished_at'] = time.time()
@@ -1003,12 +1133,13 @@ class Handler(BaseHTTPRequestHandler):
         with SERVICES_LOCK:
             if SERVICES_STATE['state'] == 'running':
                 # Already in flight — report progress rather than starting a
-                # second setup.sh racing the first over the same ollama pulls.
+                # second run racing the first over the same ollama pulls.
                 return self._send_json({'ok': True, 'already_running': True, **self._services_snapshot()})
-            SERVICES_STATE.update(
-                state='running', step=SERVICES_STEPS[0], started_at=time.time(),
-                finished_at=None, code=None, error=None, log=[],
-            )
+            # Reset from the blank template so a re-run never shows stale
+            # models/log/error rows from the previous attempt.
+            SERVICES_STATE.clear()
+            SERVICES_STATE.update(_blank_services_state())
+            SERVICES_STATE.update(state='running', step=SERVICES_STEPS[0], started_at=time.time())
         threading.Thread(target=_services_worker, name='start-services', daemon=True).start()
         with SERVICES_LOCK:
             return self._send_json({'ok': True, 'already_running': False, **self._services_snapshot()})
@@ -1017,6 +1148,7 @@ class Handler(BaseHTTPRequestHandler):
         """Caller must hold SERVICES_LOCK. Copies the log so it can't mutate mid-encode."""
         snap = dict(SERVICES_STATE)
         snap['log'] = list(SERVICES_STATE['log'])
+        snap['models'] = [dict(m) for m in SERVICES_STATE['models']]
         return snap
 
     def _handle_services_status(self):
