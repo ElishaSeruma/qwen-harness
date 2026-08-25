@@ -182,14 +182,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         return nil
     }
 
+    /// Runtime tuning for the Ollama server. Must stay in sync with the same
+    /// block in wake-up.sh — if only one launcher sets these, starting the
+    /// harness the other way silently reverts to Ollama's 4096/5m defaults.
+    /// These are server-level settings: the OpenAI-compatible endpoint the GUI
+    /// uses cannot set num_ctx or keep_alive per request.
+    private static let ollamaEnvironment: [String: String] = [
+        "OLLAMA_CONTEXT_LENGTH": "8192",
+        "OLLAMA_KEEP_ALIVE": "30m",
+        "OLLAMA_MAX_LOADED_MODELS": "1",
+        "OLLAMA_NUM_PARALLEL": "1",
+    ]
+
     private func startOllamaIfNeeded() {
-        guard !Self.processExists(named: "ollama"), let ollamaPath = Self.findExecutable("ollama") else {
-            return
+        guard let ollamaPath = Self.findExecutable("ollama") else { return }
+
+        // An already-running server was started without our environment, so it
+        // still has the old context/keep-alive. Restart it so the settings
+        // actually apply — matching wake-up.sh's behaviour.
+        if Self.processExists(named: "ollama") {
+            logger.info("Restarting Ollama to apply context/keep-alive settings")
+            let kill = Process()
+            kill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            kill.arguments = ["-x", "ollama"]
+            try? kill.run()
+            kill.waitUntilExit()
+            // Wait for the listener to actually go away rather than sleeping blindly.
+            for _ in 0..<20 {
+                if !Self.isPortOpen(11434) { break }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
         }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ollamaPath)
         process.arguments = ["serve"]
+        var env = ProcessInfo.processInfo.environment
+        for (key, value) in Self.ollamaEnvironment where env[key] == nil {
+            env[key] = value
+        }
+        process.environment = env
         process.standardOutput = Self.fileHandle(path: "/tmp/ollama.log")
         process.standardError = process.standardOutput
         do {
