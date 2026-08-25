@@ -105,6 +105,11 @@ def gh_status() -> dict:
     return {"connected": True, "login": gh.get("login"), "name": gh.get("name"), "avatar_url": gh.get("avatar_url")}
 
 
+def gh_token_for_git() -> str | None:
+    """Return the stored token for local git transport only."""
+    return _token()
+
+
 def gh_list_repos(max_results: int = 30) -> dict:
     """List repositories the connected account owns or collaborates on."""
     try:
@@ -158,5 +163,28 @@ def gh_create_issue(owner: str, repo: str, title: str, body: str = "") -> dict:
     try:
         result = _request(f"/repos/{owner}/{repo}/issues", method="POST", body={"title": title, "body": body})
         return {"status": "ok", "number": result.get("number"), "html_url": result.get("html_url")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def gh_create_repo(name: str, private: bool = True, description: str = "", auto_init: bool = False) -> dict:
+    """Create a repository for the connected account."""
+    try:
+        body = {
+            "name": name,
+            "private": private,
+            "auto_init": auto_init,
+        }
+        if description:
+            body["description"] = description
+        result = _request("/user/repos", method="POST", body=body)
+        return {
+            "status": "ok",
+            "full_name": result.get("full_name"),
+            "clone_url": result.get("clone_url"),
+            "ssh_url": result.get("ssh_url"),
+            "html_url": result.get("html_url"),
+            "default_branch": result.get("default_branch") or "main",
+        }
     except Exception as e:
         return {"error": str(e)}

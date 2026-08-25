@@ -6,6 +6,7 @@ APP_NAME="Qwen Harness"
 PRODUCT="QwenHarnessDesktop"
 APP_DIR="$ROOT/dist/$APP_NAME.app"
 BUNDLE_ID="local.qwen-harness.desktop"
+LOGO_PNG="$ROOT/AppLogo.png"
 MODE="${1:-run}"
 
 case "$MODE" in
@@ -29,6 +30,26 @@ cp "$BIN" "$APP_DIR/Contents/MacOS/$PRODUCT"
 chmod +x "$APP_DIR/Contents/MacOS/$PRODUCT"
 printf '%s\n' "$ROOT" > "$APP_DIR/Contents/Resources/repo-root.txt"
 
+if [[ -f "$LOGO_PNG" ]]; then
+  ICONSET="$ROOT/dist/AppIcon.iconset"
+  ICON_SOURCE="$ROOT/dist/AppIconSource.png"
+  rm -rf "$ICONSET"
+  mkdir -p "$ICONSET"
+  python3 "$ROOT/script/render_app_icon.py" "$LOGO_PNG" "$ICON_SOURCE"
+  sips -z 16 16 "$ICON_SOURCE" --out "$ICONSET/icon_16x16.png" >/dev/null
+  sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET/icon_16x16@2x.png" >/dev/null
+  sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET/icon_32x32.png" >/dev/null
+  sips -z 64 64 "$ICON_SOURCE" --out "$ICONSET/icon_32x32@2x.png" >/dev/null
+  sips -z 128 128 "$ICON_SOURCE" --out "$ICONSET/icon_128x128.png" >/dev/null
+  sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET/icon_128x128@2x.png" >/dev/null
+  sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET/icon_256x256.png" >/dev/null
+  sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET/icon_256x256@2x.png" >/dev/null
+  sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET/icon_512x512.png" >/dev/null
+  sips -z 1024 1024 "$ICON_SOURCE" --out "$ICONSET/icon_512x512@2x.png" >/dev/null
+  iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
+  cp "$LOGO_PNG" "$APP_DIR/Contents/Resources/AppLogo.png"
+fi
+
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -43,6 +64,10 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <string>$APP_NAME</string>
   <key>CFBundleDisplayName</key>
   <string>$APP_NAME</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIconName</key>
+  <string>AppIcon</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>

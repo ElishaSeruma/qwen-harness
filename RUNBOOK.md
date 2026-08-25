@@ -140,7 +140,57 @@ curl -s http://127.0.0.1:8420/api/github/status
 curl -s -X POST http://127.0.0.1:8420/api/github/disconnect
 ```
 
-## 9. Stop everything
+## 9. Tools available to agents (Python side)
+
+`tools/__init__.py`'s `TOOL_DEFINITIONS` is what gets handed to the model each
+turn — the model decides which to call, `execute_tool()` dispatches it. As of
+this roster (31 tools) it's worth using `tool_search` once you're at this
+scale rather than eyeballing the list. Current ones beyond computer/browser/
+file/GitHub/web control:
+
+- **`memory_write` / `memory_read` / `memory_search` / `memory_list` /
+  `memory_forget`** — persistent, cross-session store at
+  `~/.qwen-harness/memory.json` (unlike `agent.messages`, which resets every
+  process run). Use `category="user_edit"` when writing a correction you made
+  to agent output, `"preference"` for stated preferences, `"fact"` for
+  everything else — there's no separate tool for this, just a category tag
+  on the same store.
+- **`fetch_data`** — call a URL/JSON API directly (GET/POST/etc.), response
+  JSON-parsed when possible. Distinct from `scrape_url`, which is for HTML
+  pages you want as readable text.
+- **`ask_user`** — pauses and asks a clarifying question. Terminal/CLI only
+  (blocks on `input()`) — only call this from an interactive script, not from
+  the GUI's browser-side chat (which doesn't run this Python tool loop — see
+  the architecture note below).
+- **`create_display`** — renders an HTML fragment (table, report, summary) as
+  a page under `/tmp/harness_displays/` and opens it, instead of a wall of
+  plain text.
+- **`tool_search`** — searches the tool list above by keyword instead of
+  scanning all of it; returns the best-matching names + descriptions.
+- **`edit_file`** — surgical in-place edit (replace an exact `old_string`
+  with `new_string`, rest of file untouched). The primary way agents change
+  existing code — safer than `write_file` full rewrites. Errors helpfully on
+  no-match and on ambiguous matches (`replace_all` to override).
+- **`search_files` / `find_files`** — recursive content grep (file:line
+  matches, optional `*.py`-style filter) and filename-glob search. How agents
+  locate code before editing instead of guessing paths.
+- **`append_file`** — append to a file (now registered; previously dead code).
+
+When the GUI chat loop runs with tools on, the system prompt automatically
+teaches this workflow (read → edit_file → verify; search before guessing) and
+tells the model its working directory (active project path, selected
+directory, or Code-page tree root).
+
+**Architecture note:** the same registry serves both runtimes. `agent.py`'s
+Python tool loop uses it directly (`examples/*.py`, `orchestrator.py`), and
+the GUI's chat loop (`gui/agent-loop.js`) uses it over HTTP via
+`/api/tools/list` + `/api/tools/call` — so agents chatting in Home, Code,
+Projects, or the Agent Hub console can call every tool above, up to 12
+chained calls per turn. The "Agent tools" capability-bar toggle turns this
+off per session; models that can't do tool-calling (gemma3/gemma2) fall back
+to plain chat automatically with a visible note.
+
+## 10. Stop everything
 
 ```bash
 pkill -f "gui/server.py"

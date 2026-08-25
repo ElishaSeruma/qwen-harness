@@ -5,7 +5,7 @@ import Darwin
 
 private let defaultPort = 8420
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private var window: NSWindow!
     private var webView: WKWebView!
     private var statusItem: NSTextField!
@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var appURL: URL?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installApplicationIcon()
         buildWindow()
         startHarness()
         NSApp.activate(ignoringOtherApps: true)
@@ -40,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
         webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
+        webView.uiDelegate = self
 
         let reloadButton = NSButton(title: "Reload", target: self, action: #selector(reloadPage))
         reloadButton.bezelStyle = .rounded
@@ -87,6 +89,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         ])
 
         showMainWindow()
+    }
+
+    private func installApplicationIcon() {
+        if let icon = NSImage(named: "AppIcon") {
+            NSApp.applicationIconImage = icon
+            return
+        }
+        if let logoPath = Bundle.main.path(forResource: "AppLogo", ofType: "png"),
+           let logo = NSImage(contentsOfFile: logoPath) {
+            NSApp.applicationIconImage = logo
+        }
     }
 
     private func showMainWindow() {
@@ -293,6 +306,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             choosePath(id: id, directories: false, files: true)
         default:
             resolveDesktopRequest(id: id, payload: ["ok": false, "error": "unknown desktop action"])
+        }
+    }
+
+    // WKWebView does not show a native file picker for <input type="file">
+    // on its own — without this delegate method, clicking a file input in
+    // the web UI (e.g. the file-upload capability, Document Dock) silently
+    // does nothing. This is the fix for that.
+    func webView(
+        _ webView: WKWebView,
+        runOpenPanelWith parameters: WKOpenPanelParameters,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping @MainActor @Sendable ([URL]?) -> Void
+    ) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.canCreateDirectories = false
+        panel.prompt = "Choose"
+
+        panel.beginSheetModal(for: window) { response in
+            if response == .OK {
+                completionHandler(panel.urls)
+            } else {
+                completionHandler(nil)
+            }
+        }
+    }
+
+    // WKWebView has no default UI for alert()/confirm()/prompt() — without
+    // these three delegate methods, WebKit silently auto-dismisses them
+    // (confirm() always resolves to `false`, with no dialog ever shown).
+    // The entire Projects feature gates its destructive actions (delete
+    // project, push, pull, commit, merge, checkout, duplicate, delete .git)
+    // behind confirm() — that's why none of them appeared to work on Mac:
+    // every confirmation was being silently auto-cancelled.
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptAlertPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping @MainActor @Sendable () -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window) { _ in completionHandler() }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping @MainActor @Sendable (Bool) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { response in
+            completionHandler(response == .alertFirstButtonReturn)
+        }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptTextInputPanelWithPrompt prompt: String,
+        defaultText: String?,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping @MainActor @Sendable (String?) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = prompt
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: defaultText ?? "")
+        field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+        alert.accessoryView = field
+        alert.beginSheetModal(for: window) { response in
+            completionHandler(response == .alertFirstButtonReturn ? field.stringValue : nil)
         }
     }
 

@@ -257,6 +257,80 @@ TOOL_DEFINITIONS: list[dict] = [
         },
     },
 
+
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Make a surgical edit to an existing file: replace old_string with "
+                "new_string, leaving the rest untouched. PREFER THIS over write_file "
+                "when changing existing code. old_string must match exactly (including "
+                "indentation) and be unique unless replace_all is true."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string", "description": "Exact text to find (include enough context to be unique)"},
+                    "new_string": {"type": "string", "description": "Replacement text"},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_file",
+            "description": "Append content to the end of a file (creates it if missing).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": (
+                "Search file contents recursively for a string or regex (like grep -rn). "
+                "Returns file:line matches. Use this to locate code before editing it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "String or extended regex to search for"},
+                    "path": {"type": "string", "description": "Directory to search (default: current dir)"},
+                    "glob": {"type": "string", "description": "Optional filename filter, e.g. *.py"},
+                    "max_results": {"type": "integer", "description": "default 30"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": "Find files by name pattern (glob, e.g. *.py or test_*) recursively.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string", "description": "Directory to search under (default: current dir)"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+
     # ── Web search / scraping ─────────────────────────────────
     {
         "type": "function",
@@ -343,7 +417,188 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+
+    # ── Memory (persists across runs — ~/.qwen-harness/memory.json) ──
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_write",
+            "description": (
+                "Remember something for later, across sessions — a fact, a user "
+                "preference, or a correction the user made to your output. "
+                "Use category='user_edit' for corrections, 'preference' for stated "
+                "preferences, or 'fact' (default) for anything else."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Short identifier to recall this by later"},
+                    "value": {"type": "string", "description": "What to remember"},
+                    "category": {"type": "string", "description": "fact | preference | user_edit | anything else (default: fact)"},
+                },
+                "required": ["key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_read",
+            "description": "Recall a specific remembered value by its exact key.",
+            "parameters": {
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "Search everything remembered for a keyword or phrase.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "description": "default 10"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_list",
+            "description": "List remembered entries, optionally filtered to one category.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "Optional: fact | preference | user_edit | ..."},
+                    "max_results": {"type": "integer", "description": "default 50"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_forget",
+            "description": "Delete a remembered entry by key.",
+            "parameters": {
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+            },
+        },
+    },
+
+    # ── Generic API access ────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_data",
+            "description": (
+                "Call a URL or JSON API directly (GET/POST/etc.) and return its "
+                "response, parsed as JSON when possible. Use this for APIs — use "
+                "scrape_url instead for HTML pages you want as readable text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "method": {"type": "string", "description": "GET, POST, etc. (default GET)"},
+                    "headers": {"type": "object", "description": "Optional extra request headers"},
+                    "body": {"type": "object", "description": "Optional JSON request body"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+
+    # ── Human interaction / display ───────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": (
+                "Pause and ask the human a clarifying question when you're blocked "
+                "or genuinely unsure how to proceed. Terminal/CLI use only — blocks "
+                "for input, so only call this when running interactively."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"question": {"type": "string"}},
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_display",
+            "description": (
+                "Render something visual for the user — a table, small report, or "
+                "formatted summary — as an HTML page, and open it. Use instead of a "
+                "wall of plain text when a table or structured layout would read better."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "html": {"type": "string", "description": "HTML fragment to render (e.g. a <table> or <div>...</div>)"},
+                    "title": {"type": "string", "description": "Page title (default 'Agent display')"},
+                },
+                "required": ["html"],
+            },
+        },
+    },
+
+    # ── Tool discovery (for when the full list above gets long) ──
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_search",
+            "description": (
+                "Search for relevant tools by keyword instead of scanning the full "
+                "tool list — useful once many tools are available. Returns the best-"
+                "matching tool names and descriptions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What you're trying to do"},
+                    "max_results": {"type": "integer", "description": "default 5"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
+
+
+# ── Tool discovery ─────────────────────────────────────────────────────────
+# Implemented here (not tools/discovery.py) since it needs TOOL_DEFINITIONS
+# in scope and tools/*.py modules don't import back from tools/__init__.py.
+
+def _tool_search(query: str, max_results: int = 5) -> dict:
+    words = [w for w in query.lower().split() if w]
+    scored = []
+    for entry in TOOL_DEFINITIONS:
+        fn = entry["function"]
+        if fn["name"] == "tool_search":
+            continue
+        haystack = f"{fn['name']} {fn['description']}".lower()
+        score = sum(haystack.count(w) for w in words)
+        if score > 0:
+            scored.append((score, fn["name"], fn["description"]))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return {
+        "status": "ok",
+        "query": query,
+        "results": [{"name": n, "description": d} for _, n, d in scored[:max_results]],
+    }
 
 
 # ── Tool dispatcher ───────────────────────────────────────────────────────────
@@ -404,6 +659,18 @@ def execute_tool(name: str, args: dict[str, Any]) -> Any:
         elif name == "run_shell":
             from tools.files import run_shell
             return run_shell(**args)
+        elif name == "edit_file":
+            from tools.files import edit_file
+            return edit_file(**args)
+        elif name == "append_file":
+            from tools.files import append_file
+            return append_file(**args)
+        elif name == "search_files":
+            from tools.files import search_files
+            return search_files(**args)
+        elif name == "find_files":
+            from tools.files import find_files
+            return find_files(**args)
 
         # Web tools
         elif name == "web_search":
@@ -426,6 +693,40 @@ def execute_tool(name: str, args: dict[str, Any]) -> Any:
         elif name == "github_get_file":
             from tools.github import gh_get_file
             return gh_get_file(**args)
+
+        # Web tools (generic API access)
+        elif name == "fetch_data":
+            from tools.web import fetch_data
+            return fetch_data(**args)
+
+        # Memory tools
+        elif name == "memory_write":
+            from tools.memory import memory_write
+            return memory_write(**args)
+        elif name == "memory_read":
+            from tools.memory import memory_read
+            return memory_read(**args)
+        elif name == "memory_search":
+            from tools.memory import memory_search
+            return memory_search(**args)
+        elif name == "memory_list":
+            from tools.memory import memory_list
+            return memory_list(**args)
+        elif name == "memory_forget":
+            from tools.memory import memory_forget
+            return memory_forget(**args)
+
+        # Human interaction / display
+        elif name == "ask_user":
+            from tools.interaction import ask_user
+            return ask_user(**args)
+        elif name == "create_display":
+            from tools.interaction import create_display
+            return create_display(**args)
+
+        # Tool discovery
+        elif name == "tool_search":
+            return _tool_search(**args)
 
         else:
             return {"error": f"Unknown tool: {name}"}

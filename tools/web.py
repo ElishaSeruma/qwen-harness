@@ -8,9 +8,11 @@ HTML-to-text parser), no BeautifulSoup dependency.
 """
 
 from __future__ import annotations
+import json
 import re
 import urllib.parse
 import urllib.request
+import urllib.error
 from html.parser import HTMLParser
 
 USER_AGENT = (
@@ -144,3 +146,33 @@ def scrape_url(url: str, max_chars: int = MAX_SCRAPE_CHARS) -> dict:
         }
     except Exception as e:
         return {"error": str(e), "url": url}
+
+
+def fetch_data(url: str, method: str = "GET", headers: dict | None = None, body: dict | None = None) -> dict:
+    """
+    Call a URL/API directly and return its response — for JSON APIs, unlike
+    scrape_url (which is for HTML pages). Response is JSON-parsed when
+    possible, otherwise returned as raw text (truncated to 8000 chars).
+    """
+    try:
+        req_headers = {"User-Agent": USER_AGENT, **(headers or {})}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            req_headers.setdefault("Content-Type", "application/json")
+        req = urllib.request.Request(url, data=data, method=method.upper(), headers=req_headers)
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            raw = resp.read().decode(charset, errors="replace")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        status = e.code
+    except Exception as e:
+        return {"error": str(e), "url": url}
+
+    try:
+        parsed = json.loads(raw)
+        return {"status": "ok", "http_status": status, "url": url, "json": parsed}
+    except json.JSONDecodeError:
+        return {"status": "ok", "http_status": status, "url": url, "text": raw[:8000]}

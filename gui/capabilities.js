@@ -11,6 +11,10 @@ async function readJsonResponse(res, fallback) {
   if (!res.ok || data.error) {
     const err = new Error(data.error || fallback || `request failed (${res.status})`);
     Object.assign(err, data);
+    // Broadcast for the global helper-toast system (app.js listens) so every
+    // API failure surfaces a toast with a what-to-do suggestion, without each
+    // call site needing to remember to show one.
+    window.dispatchEvent(new CustomEvent('qh-api-error', { detail: { message: err.message, status: res.status } }));
     throw err;
   }
   return data;
@@ -83,11 +87,99 @@ export async function apiExec(command, cwd) {
   });
   return readJsonResponse(res, `exec failed (${res.status})`);
 }
+export async function apiToolsList() {
+  const res = await fetch(`${API}/api/tools/list`, { cache: 'no-store' });
+  return readJsonResponse(res, `tools list failed (${res.status})`);
+}
+export async function apiToolCall(name, args) {
+  const res = await fetch(`${API}/api/tools/call`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, args }),
+  });
+  const data = await readJsonResponse(res, `tool call failed (${res.status})`);
+  return data.result;
+}
 export async function apiHealth() {
   try {
     const res = await fetch(`${API}/api/health`, { cache: 'no-store' });
     return res.ok;
   } catch { return false; }
+}
+export async function apiSystemStats() {
+  const res = await fetch(`${API}/api/system/stats`, { cache: 'no-store' });
+  return readJsonResponse(res, `system stats failed (${res.status})`);
+}
+
+// ── Supabase: persisted chats, memory matrix, work-done log ──────────────
+export async function apiSupabaseStatus() {
+  const res = await fetch(`${API}/api/supabase/status`, { cache: 'no-store' });
+  return readJsonResponse(res, `supabase status failed (${res.status})`);
+}
+export async function apiSupabaseConnect(url, serviceRoleKey) {
+  const res = await fetch(`${API}/api/supabase/connect`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, service_role_key: serviceRoleKey }),
+  });
+  return readJsonResponse(res, `supabase connect failed (${res.status})`);
+}
+export async function apiSupabaseDisconnect() {
+  const res = await fetch(`${API}/api/supabase/disconnect`, { method: 'POST' });
+  return readJsonResponse(res, `supabase disconnect failed (${res.status})`);
+}
+export async function apiChatsList(agentId) {
+  const q = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : '';
+  const res = await fetch(`${API}/api/chats${q}`, { cache: 'no-store' });
+  return readJsonResponse(res, `chats list failed (${res.status})`);
+}
+export async function apiChatCreate(payload) {
+  const res = await fetch(`${API}/api/chats`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `chat create failed (${res.status})`);
+}
+export async function apiChatMessages(chatId) {
+  const res = await fetch(`${API}/api/chats/messages?chat_id=${encodeURIComponent(chatId)}`, { cache: 'no-store' });
+  return readJsonResponse(res, `chat messages failed (${res.status})`);
+}
+export async function apiChatAddMessage(payload) {
+  const res = await fetch(`${API}/api/chats/messages`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `add message failed (${res.status})`);
+}
+export async function apiChatTouch(chatId, title) {
+  const res = await fetch(`${API}/api/chats/touch`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, title }),
+  });
+  return readJsonResponse(res, `chat touch failed (${res.status})`);
+}
+export async function apiChatTokens(chatId, currentTokens) {
+  const res = await fetch(`${API}/api/chats/tokens`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, current_tokens: currentTokens }),
+  });
+  return readJsonResponse(res, `chat tokens failed (${res.status})`);
+}
+export async function apiChatCompact(payload) {
+  const res = await fetch(`${API}/api/chats/compact`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `chat compact failed (${res.status})`);
+}
+export async function apiChatCompaction(chatId) {
+  const res = await fetch(`${API}/api/chats/compaction?chat_id=${encodeURIComponent(chatId)}`, { cache: 'no-store' });
+  return readJsonResponse(res, `chat compaction failed (${res.status})`);
+}
+export async function apiMemoryWrite(payload) {
+  const res = await fetch(`${API}/api/memory/write`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `memory write failed (${res.status})`);
+}
+export async function apiWorkDone(payload) {
+  const res = await fetch(`${API}/api/work-done`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `work-done log failed (${res.status})`);
 }
 export async function apiWebSearch(query, maxResults = 5) {
   const res = await fetch(`${API}/api/web/search?q=${encodeURIComponent(query)}&max_results=${maxResults}`);
@@ -115,6 +207,62 @@ export async function apiGithubDisconnect() {
 export async function apiGithubRepos() {
   const res = await fetch(`${API}/api/github/repos`);
   return readJsonResponse(res, `list repos failed (${res.status})`);
+}
+export async function apiProjects() {
+  const res = await fetch(`${API}/api/projects`, { cache: 'no-store' });
+  return readJsonResponse(res, `projects failed (${res.status})`);
+}
+export async function apiProjectCreate(payload) {
+  const res = await fetch(`${API}/api/projects/create`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `project create failed (${res.status})`);
+}
+export async function apiProjectAddDocs(projectId, documents) {
+  const res = await fetch(`${API}/api/projects/docs/add`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId, documents }),
+  });
+  return readJsonResponse(res, `document upload failed (${res.status})`);
+}
+export async function apiProjectReadDoc(projectId, name) {
+  const res = await fetch(`${API}/api/projects/docs/read?project_id=${encodeURIComponent(projectId)}&name=${encodeURIComponent(name)}`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const err = new Error(data.error || `document read failed (${res.status})`);
+    Object.assign(err, data);
+    throw err;
+  }
+  return res.text();
+}
+export async function apiProjectPublishGithub(payload) {
+  const res = await fetch(`${API}/api/projects/github/publish`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `publish failed (${res.status})`);
+}
+export async function apiProjectGitAction(payload) {
+  const res = await fetch(`${API}/api/projects/git/action`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `git action failed (${res.status})`);
+}
+export async function apiProjectDelete(payload) {
+  const res = await fetch(`${API}/api/projects/delete`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `project delete failed (${res.status})`);
+}
+export async function apiProjectSettings(payload) {
+  const res = await fetch(`${API}/api/projects/settings`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `project settings failed (${res.status})`);
 }
 
 const desktopPending = new Map();
@@ -151,6 +299,7 @@ function desktopAction(action) {
 const DIR_KEY = 'qh-directory-v1';
 const HOTPHRASES_KEY = 'qh-hotphrases-v1';
 const CONNECTORS_KEY = 'qh-connectors-v2'; // v2: GitHub + web search are no longer "coming soon"
+const TOOLS_ENABLED_KEY = 'qh-tools-enabled-v1';
 
 export const CONNECTOR_DEFS = [
   { id: 'filesystem', label: 'Filesystem', icon: '📁', always: true },
@@ -160,7 +309,21 @@ export const CONNECTOR_DEFS = [
   { id: 'upload', label: 'File upload', icon: '📎' },
   { id: 'websearch', label: 'Web search', icon: '🔎' },
   { id: 'github', label: 'GitHub', icon: '⎇' },
+  { id: 'supabase', label: 'Supabase', icon: '🗄' },
+  { id: 'ai', label: 'AI actions', icon: '✨' },
+  // Not a drawer-opener like the others: this one is a runtime mode switch
+  // (does the chat loop send `tools=` to the model at all?), handled as a
+  // special case in renderCapabilityBar below.
+  { id: 'agent_tools', label: 'Agent tools', icon: '🔧', toggle: true },
 ];
+
+export function getToolsEnabled() {
+  const raw = localStorage.getItem(TOOLS_ENABLED_KEY);
+  return raw === null ? true : raw === 'true';
+}
+export function setToolsEnabled(enabled) {
+  localStorage.setItem(TOOLS_ENABLED_KEY, String(enabled));
+}
 
 export function getDirectory() {
   return localStorage.getItem(DIR_KEY) || '';
@@ -207,6 +370,9 @@ export function setConnectorEnabled(id, enabled) {
 let lastFocusedComposer = null;
 export function trackComposerFocus(el) {
   el.addEventListener('focus', () => { lastFocusedComposer = el; });
+}
+export function getLastComposerValue() {
+  return lastFocusedComposer?.value ?? '';
 }
 export function insertIntoLastComposer(text) {
   const el = lastFocusedComposer;
@@ -257,10 +423,26 @@ export function renderCapabilityBar(container, opts) {
   const connectors = getConnectors();
   for (const def of CONNECTOR_DEFS) {
     if (def.id === 'filesystem') continue; // implicit, no button needed
-    const enabled = connectors[def.id];
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'cap-btn';
+
+    if (def.toggle) {
+      // A runtime mode switch (e.g. "agent_tools"), not a drawer-opener —
+      // reflects its own on/off state rather than the connectors list.
+      const on = getToolsEnabled();
+      btn.classList.toggle('is-on', on);
+      btn.title = `${def.label}: ${on ? 'on' : 'off'} — click to toggle`;
+      btn.innerHTML = `<span class="cap-icon">${def.icon}</span><span>${def.label}: ${on ? 'On' : 'Off'}</span>`;
+      btn.addEventListener('click', () => {
+        setToolsEnabled(!getToolsEnabled());
+        renderCapabilityBar(container, opts);
+      });
+      container.append(btn);
+      continue;
+    }
+
+    const enabled = connectors[def.id];
     btn.disabled = !enabled;
     btn.title = def.comingSoon ? `${def.label} (coming soon)` : def.label;
     btn.innerHTML = `<span class="cap-icon">${def.icon}</span><span>${def.label}</span>`;

@@ -25,6 +25,10 @@
         <span class="rail-icon" aria-hidden="true">&lt;/&gt;</span>
         <span>Code</span>
       </button>
+      <button class="rail-link" type="button" data-route="projects">
+        <span class="rail-icon" aria-hidden="true">▦</span>
+        <span>Projects</span>
+      </button>
       <button class="rail-link" type="button" data-route="hub">
         <span class="rail-icon" aria-hidden="true">◈</span>
         <span>Agent hub</span>
@@ -62,9 +66,32 @@
     <main class="home-view view" id="view-home">
 
       <div class="home-greeting">
-        <p class="home-eyebrow" id="home-date">—</p>
-        <h1 id="home-greeting-text">Good day</h1>
-        <p class="home-sub">Pass instructions to your agents.</p>
+        <div class="home-greeting-inner">
+          <div class="home-greeting-avatars" id="home-greeting-avatars"></div>
+          <div class="home-greeting-copy">
+            <p class="home-eyebrow" id="home-date">—</p>
+            <h1 id="home-greeting-text">Good day</h1>
+            <p class="home-sub">Pass instructions to your agents.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="resource-monitor" id="resource-monitor" aria-label="Resource monitor">
+        <div class="resource-system">
+          <div class="resource-stat">
+            <span class="resource-stat-label">CPU</span>
+            <div class="resource-bar"><div class="resource-bar-fill" id="rm-cpu-fill"></div></div>
+            <span class="resource-stat-value" id="rm-cpu-value">—</span>
+          </div>
+          <div class="resource-stat">
+            <span class="resource-stat-label">Memory</span>
+            <div class="resource-bar"><div class="resource-bar-fill" id="rm-mem-fill"></div></div>
+            <span class="resource-stat-value" id="rm-mem-value">—</span>
+          </div>
+        </div>
+        <div class="resource-tasks" id="resource-tasks">
+          <span class="resource-idle">No active inference</span>
+        </div>
       </div>
 
       <div class="composer-shell" id="home-composer-shell">
@@ -72,6 +99,8 @@
         <textarea id="home-composer-input" class="composer-textarea" rows="3" placeholder="Type an instruction…"></textarea>
         <div id="home-attachment-list" class="attachment-list"></div>
         <div class="composer-toolbar">
+          <button id="home-chats-btn" type="button" class="mode-button" title="Open chats">💬 Chats</button>
+          <button id="home-new-chat-btn" type="button" class="mode-button" title="Start a new chat">+ New</button>
           <label class="field field-inline">
             <span>Send to</span>
             <select id="home-agent-target"></select>
@@ -150,9 +179,10 @@
         </div>
 
         <div class="code-tab-panel" id="tab-terminal" hidden>
+          <button id="terminal-copy" type="button" class="mode-button terminal-copy-btn">Copy output</button>
           <div class="transcript terminal-output" id="terminal-output"></div>
           <form class="composer" id="terminal-composer">
-            <input id="terminal-input" type="text" placeholder="$ command" autocomplete="off" />
+            <input id="terminal-input" type="text" placeholder="$ command" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
             <button type="submit">Run</button>
           </form>
         </div>
@@ -166,6 +196,205 @@
         </div>
       </section>
 
+    </main>
+
+    <!-- ── PROJECTS ─────────────────────────────────────────────────── -->
+    <main class="projects-view view" id="view-projects" hidden>
+      <section class="panel project-create-panel" aria-label="Create project">
+        <button id="project-create-toggle" class="panel-toggle" type="button" aria-expanded="false">
+          <span>New Project +</span>
+        </button>
+        <div id="project-create-body" class="project-create-body" hidden>
+        <div class="panel-head">
+          <h2>New project</h2>
+          <p class="panel-copy">Choose a parent folder, create a working directory, then approve Git initialization.</p>
+        </div>
+        <form id="project-create-form" class="project-create-form">
+          <label class="field">
+            <span>Name</span>
+            <input id="project-name" type="text" placeholder="Research brief" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>Parent folder</span>
+            <div class="inline-field-row">
+              <input id="project-parent-dir" type="text" placeholder="/Users/you/Projects" autocomplete="off" />
+              <button id="project-choose-parent" type="button" class="mode-button">Choose</button>
+            </div>
+          </label>
+          <label class="check-row">
+            <input id="project-init-git" type="checkbox" />
+            <span>I approve creating a new working directory with a `.git` repository.</span>
+          </label>
+          <label class="check-row">
+            <input id="project-publish-github" type="checkbox" />
+            <span>Offer to publish this project to GitHub after creation.</span>
+          </label>
+          <button type="submit" class="send-button">Create Project</button>
+          <p id="project-create-status" class="panel-copy"></p>
+        </form>
+        </div>
+      </section>
+
+      <section class="panel project-list-panel" aria-label="Projects">
+        <div class="panel-head">
+          <h2>Projects</h2>
+          <p class="panel-copy">Persisted workspaces with documents and a Git repo.</p>
+        </div>
+        <div id="project-list" class="project-list"></div>
+      </section>
+
+      <section class="panel project-detail-panel" aria-label="Project detail">
+        <div class="panel-head project-detail-head">
+          <div>
+            <h2 id="project-detail-title">Select a project</h2>
+            <p class="panel-copy" id="project-detail-path">—</p>
+          </div>
+          <div class="project-detail-actions">
+            <button id="project-open-working-dir" type="button" class="mode-button" disabled>Open in Files</button>
+            <button id="project-workspace-toggle" type="button" class="mode-button" aria-expanded="false" disabled>Workspace +</button>
+          </div>
+        </div>
+
+        <div id="project-workspace-body" class="project-workspace-body" hidden>
+        <section class="project-control-room" aria-label="Project control room">
+          <div class="resource-monitor project-resource-monitor" aria-label="Project resource monitor">
+            <div class="resource-system">
+              <div class="resource-stat">
+                <span class="resource-stat-label">CPU</span>
+                <div class="resource-bar"><div class="resource-bar-fill" id="project-rm-cpu-fill"></div></div>
+                <span class="resource-stat-value" id="project-rm-cpu-value">—</span>
+              </div>
+              <div class="resource-stat">
+                <span class="resource-stat-label">Memory</span>
+                <div class="resource-bar"><div class="resource-bar-fill" id="project-rm-mem-fill"></div></div>
+                <span class="resource-stat-value" id="project-rm-mem-value">—</span>
+              </div>
+            </div>
+            <div class="resource-tasks" id="project-resource-tasks">
+              <span class="resource-idle">No active inference</span>
+            </div>
+          </div>
+          <div class="composer-shell project-composer-shell">
+            <div class="capability-bar" id="project-capbar"></div>
+            <textarea id="project-composer-input" class="composer-textarea" rows="3" placeholder="Type a project instruction..."></textarea>
+            <div class="composer-toolbar">
+              <label class="field field-inline">
+                <span>Send to</span>
+                <select id="project-agent-target"></select>
+              </label>
+              <label class="field field-inline">
+                <span>Model</span>
+                <select id="project-model-select"></select>
+              </label>
+              <button id="project-send" type="button" class="send-button" disabled>Send</button>
+            </div>
+          </div>
+          <div class="home-feed project-main-feed" id="project-main-feed">
+            <p class="transcript-empty">Project-scoped agent responses appear here.</p>
+          </div>
+        </section>
+
+        <div class="project-detail-grid">
+          <section class="document-dock" aria-label="Document dock">
+            <div class="dock-head">
+              <h3>Document dock</h3>
+              <label class="mode-button doc-upload-button">
+                Upload .md
+                <input id="project-doc-upload" type="file" accept=".md,text/markdown,text/plain" multiple hidden />
+              </label>
+            </div>
+            <div id="project-doc-list" class="drawer-list project-doc-list"></div>
+          </section>
+
+          <section class="project-context" aria-label="Document context">
+            <h3 id="project-doc-title">Context</h3>
+            <textarea id="project-doc-preview" class="code-editor project-doc-preview" readonly placeholder="Upload or select markdown documents."></textarea>
+          </section>
+        </div>
+
+        <div class="project-github-panel">
+          <div>
+            <h3>Git</h3>
+            <p id="project-github-status" class="panel-copy">Select a project to publish.</p>
+          </div>
+          <div class="project-actions-cluster">
+            <button id="project-actions-toggle" type="button" class="mode-button project-actions-main" disabled>Git Actions</button>
+            <div id="project-git-controls" class="project-git-controls" hidden>
+              <button id="project-git-status" type="button" class="mode-button" disabled>Status</button>
+              <button id="project-git-log" type="button" class="mode-button" disabled>Log</button>
+              <button id="project-github-create" type="button" class="mode-button" disabled>Create Repo</button>
+              <button id="project-git-commit" type="button" class="mode-button" disabled>Commit</button>
+              <button id="project-git-push" type="button" class="mode-button" disabled>Push</button>
+              <button id="project-git-pull" type="button" class="mode-button" disabled>Pull</button>
+              <button id="project-git-fetch" type="button" class="mode-button" disabled>Fetch</button>
+              <button id="project-git-branches" type="button" class="mode-button" disabled>Branches</button>
+              <button id="project-git-checkout" type="button" class="mode-button" disabled>Checkout</button>
+              <button id="project-git-merge" type="button" class="mode-button" disabled>Merge</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="project-github-form" id="project-github-form" hidden>
+          <label class="field">
+            <span>Repository name</span>
+            <input id="project-repo-name" type="text" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>Description</span>
+            <input id="project-repo-description" type="text" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>Visibility</span>
+            <select id="project-repo-visibility">
+              <option value="private">Private</option>
+              <option value="public">Public</option>
+            </select>
+          </label>
+          <label class="check-row">
+            <input id="project-repo-readme" type="checkbox" />
+            <span>Add README on GitHub. Licenses are left out.</span>
+          </label>
+          <div class="project-form-actions">
+            <button id="project-repo-create-confirm" type="button" class="mode-button" disabled>Create GitHub Repo</button>
+            <button id="project-repo-publish-confirm" type="button" class="mode-button" disabled>Create + Initial Push</button>
+            <button id="project-repo-create-cancel" type="button" class="ghost-button">Cancel</button>
+          </div>
+        </div>
+
+        <section class="project-agent-panel" aria-label="Project agents">
+          <div class="dock-head">
+            <h3>Project agents</h3>
+            <button id="project-agent-save" type="button" class="mode-button" disabled>Save Agents</button>
+          </div>
+          <div id="project-agent-list" class="project-agent-list"></div>
+          <form id="project-agent-composer" class="composer project-agent-composer">
+            <input id="project-agent-input" type="text" placeholder="Message selected project agents..." autocomplete="off" />
+            <button id="project-agent-send" type="submit" disabled>Send</button>
+          </form>
+          <div id="project-agent-feed" class="transcript project-agent-feed">
+            <p class="transcript-empty">Project agent messages appear here.</p>
+          </div>
+        </section>
+
+        <details class="project-settings-panel" id="project-settings-panel">
+          <summary>Project Settings</summary>
+          <div class="project-settings-grid">
+            <label class="field">
+              <span>Duplicate name</span>
+              <input id="project-duplicate-name" type="text" autocomplete="off" />
+            </label>
+            <button id="project-duplicate" type="button" class="mode-button" disabled>Duplicate Project</button>
+            <button id="project-delete-git" type="button" class="mode-button mode-button-danger" disabled>Delete .git Only</button>
+            <label class="check-row">
+              <input id="project-remove-files" type="checkbox" />
+              <span>Also delete the working directory from disk.</span>
+            </label>
+            <button id="project-remove" type="button" class="mode-button mode-button-danger" disabled>Delete Project</button>
+          </div>
+        </details>
+        <pre id="project-git-output" class="project-git-output">Git output will appear here.</pre>
+        </div>
+      </section>
     </main>
 
     <!-- ── AGENT HUB ────────────────────────────────────────────────── -->
@@ -250,6 +479,9 @@
   </div>
   <div class="cap-drawer-body" id="cap-drawer-body"></div>
 </div>
+
+<!-- ── helper toasts: errors + actionable suggestions ── -->
+<div class="toast-stack" id="toast-stack" aria-live="polite"></div>
 
 <script type="module" src="app.js"></script>
 </body>

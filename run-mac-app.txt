@@ -1,0 +1,2 @@
+cd qwen-harness % cd /Applications/qwen-harness
+./script/build_and_run.sh
