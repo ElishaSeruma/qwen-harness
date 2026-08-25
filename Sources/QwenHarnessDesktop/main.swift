@@ -122,14 +122,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     private func installApplicationIcon() {
-        if let icon = NSImage(named: "AppIcon") {
-            NSApp.applicationIconImage = icon
-            return
-        }
-        if let logoPath = Bundle.main.path(forResource: "AppLogo", ofType: "png"),
-           let logo = NSImage(contentsOfFile: logoPath) {
-            NSApp.applicationIconImage = logo
-        }
+        // Load the generated .icns, which already carries the rounded macOS
+        // silhouette. The previous version fell back to the raw AppLogo.png —
+        // a full-bleed square with no rounding — which is why the running app
+        // showed hard corners while the quit app (drawn from the bundle icon)
+        // showed rounded ones. There is deliberately no fallback now: if the
+        // icns is missing, leaving CFBundleIconFile to the system beats
+        // force-installing an unmasked square.
+        guard let iconPath = Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
+              let icon = NSImage(contentsOfFile: iconPath) else { return }
+        NSApp.applicationIconImage = icon
     }
 
     private func showMainWindow() {

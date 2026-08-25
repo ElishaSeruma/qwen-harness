@@ -52,7 +52,6 @@ if [[ -f "$LOGO_PNG" ]]; then
   sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET/icon_512x512.png" >/dev/null
   sips -z 1024 1024 "$ICON_SOURCE" --out "$ICONSET/icon_512x512@2x.png" >/dev/null
   iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
-  cp "$LOGO_PNG" "$APP_DIR/Contents/Resources/AppLogo.png"
 fi
 
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
