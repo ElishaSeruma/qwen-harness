@@ -33,6 +33,10 @@
         <span class="rail-icon" aria-hidden="true">◈</span>
         <span>Agent hub</span>
       </button>
+      <button class="rail-link" type="button" data-route="skills">
+        <span class="rail-icon" aria-hidden="true">✦</span>
+        <span>Skills &amp; tools</span>
+      </button>
     </nav>
     <button class="rail-theme" id="theme-toggle" type="button" title="Toggle dark mode">
       <span id="theme-icon">◐</span>
@@ -50,6 +54,9 @@
         <button id="services-toggle" class="services-toggle" type="button" data-state="idle" title="Start Ollama and check models are ready">
           <span class="status-dot" aria-hidden="true"></span>
           <span id="services-label">Start services</span>
+        </button>
+        <button id="tools-toggle" class="activity-toggle" type="button" aria-expanded="false" title="List every tool the models can call">
+          Tools <span id="tools-count">0</span>
         </button>
         <button id="activity-toggle" class="activity-toggle" type="button" aria-expanded="false" title="Open activity">
           Activity <span id="activity-count">0</span>
@@ -500,6 +507,33 @@
       </div>
     </main>
 
+    <!-- ── SKILLS & TOOLS ───────────────────────────────────────────── -->
+    <main class="skills-view view" id="view-skills" hidden>
+      <section class="panel skills-panel" aria-label="Skills and tools catalog">
+        <div class="panel-head">
+          <h2>Skills &amp; Tools</h2>
+          <p class="panel-copy">Installed skills are safe, instruction-only workflows. Start a message with a slash command to activate one.</p>
+        </div>
+        <details class="add-skill" id="add-skill-panel">
+          <summary>Add skill</summary>
+          <form id="add-skill-form" class="add-skill-form">
+            <label class="field add-skill-upload"><span>Import Markdown instructions (optional)</span><input id="add-skill-markdown" name="markdown" type="file" accept=".md,text/markdown,text/plain" /><small>Choose a SKILL.md to fill this form, or write the fields below manually.</small></label>
+            <label class="field"><span>Skill command</span><input name="name" placeholder="my-workflow (used as /my-workflow)" pattern="[a-z0-9]+(-[a-z0-9]+)*" required /></label>
+            <label class="field"><span>Description</span><input name="description" maxlength="500" placeholder="What this skill helps with" required /></label>
+            <label class="field"><span>Instructions</span><textarea name="instructions" rows="5" maxlength="12000" placeholder="Steps the agent should follow when this skill is invoked" required></textarea></label>
+            <label class="field"><span>Required tools (optional)</span><input name="tools" placeholder="web_search, read_file" /></label>
+            <div class="add-skill-actions"><button class="mode-button" type="submit">Install skill</button><p class="panel-copy" id="add-skill-status" aria-live="polite"></p></div>
+          </form>
+        </details>
+        <div class="catalog-tabs" role="tablist" aria-label="Catalog type">
+          <button class="mode-button is-active" id="catalog-skills-tab" type="button" role="tab" aria-selected="true">Skills</button>
+          <button class="mode-button" id="catalog-tools-tab" type="button" role="tab" aria-selected="false">Tools</button>
+        </div>
+        <div id="skills-catalog" class="catalog-list" role="tabpanel"></div>
+        <div id="tools-catalog" class="catalog-list" role="tabpanel" hidden></div>
+      </section>
+    </main>
+
   </div>
 </div>
 
@@ -514,6 +548,19 @@
   <div id="activity-list" class="activity-list">
     <p class="transcript-empty">No runs yet.</p>
   </div>
+</aside>
+
+<aside class="activity-drawer tools-drawer" id="tools-drawer" hidden aria-label="Available tools">
+  <div class="activity-drawer-head">
+    <div>
+      <span class="eyebrow">tools/__init__.py</span>
+      <h2>Tools</h2>
+    </div>
+    <button id="tools-close" class="icon-button" type="button" title="Close tools" aria-label="Close tools">&times;</button>
+  </div>
+  <div class="tools-status" id="tools-status" data-state="ok"></div>
+  <input id="tools-filter" class="tools-filter" type="search" placeholder="Filter tools…" aria-label="Filter tools" autocomplete="off">
+  <div id="tools-list" class="tools-list"></div>
 </aside>
 
 <aside class="activity-drawer" id="services-drawer" hidden aria-label="Service startup log">

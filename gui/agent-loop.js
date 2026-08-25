@@ -6,14 +6,17 @@
 // capability-bar toggle is off, this degrades to a plain one-shot chat call
 // (no `tools=` sent), so it's a drop-in replacement for the old callOllama().
 
-import { apiToolsList, apiToolCall, getToolsEnabled } from './capabilities.js';
-import { EFFORT_LEVELS, parseEffortEscalation } from './effort.js';
+import { apiToolsList, apiToolCall, apiSkillsList, getToolsEnabled } from './capabilities.js';
+import { EFFORT_LEVELS, parseEffortEscalation, wantsToolUse } from './effort.js';
 
 const OLLAMA_URL = 'http://localhost:11434/v1/chat/completions';
 // Hard ceiling on elapsed time for one turn, independent of the token budget.
 // Token budgets don't bound wall-clock: at qwen3:4b's measured 7.3 tok/s, Max
 // effort (6144 tokens x 18 iterations) is ~2.8 hours.
 const DEFAULT_DEADLINE_MS = 10 * 60 * 1000;
+const WEB_TOOLS = ['web_search', 'scrape_url', 'fetch_data'];
+const WEB_INTENT = /\b(web|internet|online|google|search|browse|news|url|website|look\s?up)\b/i;
+
 const EFFORT_ESCALATION_TOOL = {
   type: 'function',
   function: {
@@ -80,11 +83,30 @@ function loadToolDefs() {
   return toolDefsPromise;
 }
 
+let skillDefsPromise = null;
+export function invalidateSkillDefs() { skillDefsPromise = null; }
+function loadSkills() {
+  if (!skillDefsPromise) skillDefsPromise = apiSkillsList().then(r => r.skills || []);
+  return skillDefsPromise;
+}
+
+// A slash skill is explicit and deterministic: only a leading /name activates
+// it, avoiding accidental prompt injection from prose that happens to mention a
+// skill name. Its instructions and requested tools are independent of effort.
+async function activateSlashSkill(text) {
+  const match = /^\s*\/([a-z0-9]+(?:-[a-z0-9]+)*)\b\s*/i.exec(text || '');
+  if (!match) return { text, skill: null };
+  const name = match[1].toLowerCase();
+  const skill = (await loadSkills()).find(item => item.name === name);
+  if (!skill) return { text, skill: null, unknown: name };
+  return { text: text.slice(match[0].length).trim() || `Follow the ${skill.command} workflow.`, skill };
+}
+
 // All 35 tool schemas is ~3k tokens of prompt on EVERY request — enough to
 // stall a 4B model on an 8GB CPU-only machine before it emits anything.
 // Each surface therefore sends only the tools it plausibly needs; agents can
 // still reach the rest via tool_search, which is always included.
-const TOOL_PROFILES = {
+export const TOOL_PROFILES = {
   code: [
     'read_file', 'write_file', 'edit_file', 'append_file', 'list_dir',
     'search_files', 'find_files', 'run_shell',
@@ -172,7 +194,7 @@ async function modelParamBillions(modelKey) {
   return info.get(modelKey)?.paramBillions ?? null;
 }
 
-async function modelSupportsTools(modelKey) {
+export async function modelSupportsTools(modelKey) {
   const info = await loadModelInfo();
   return (info.get(modelKey)?.capabilities || []).includes('tools');
 }
@@ -235,10 +257,24 @@ function stripThink(text) {
  */
 export async function runAgentTurn({ modelKey, systemPrompt, userText, priorMessages = [], cwd = null, toolProfile = 'home', deadlineMs = DEFAULT_DEADLINE_MS, signal = null, runId = null, onEvent, onToken, onApprovalRequest, onEffortEscalation, toolsEnabled = null, effort = 1 }) {
   let activeEffort = Math.max(1, Math.min(4, Number(effort) || 1));
+  const activated = await activateSlashSkill(userText);
+  userText = activated.text;
+  if (activated.unknown) onEvent?.({ type: 'system', text: `Unknown skill /${activated.unknown}. Open Skills & Tools to see installed commands.` });
+  if (activated.skill) onEvent?.({ type: 'system', text: `Skill active: ${activated.skill.command} — ${activated.skill.description}` });
+  // A slash skill must remain usable even when the composer is set to Quick.
+  // Focus is the smallest budget that reliably permits an instruction + tool
+  // call + result cycle; higher user-selected effort remains unchanged.
+  if (activated.skill) activeEffort = Math.max(2, activeEffort);
   const wantsTools = toolsEnabled == null ? getToolsEnabled() : Boolean(toolsEnabled);
   const canUseTools = wantsTools && await modelSupportsTools(modelKey);
   if (wantsTools && !canUseTools) {
-    onEvent?.({ type: 'system', text: `${modelKey} doesn't support tool-calling — replying without tools.` });
+    // Models without the `tools` capability (gemma*) can't be made to call one
+    // by prompting. When the user explicitly asked for tool work, say so plainly
+    // rather than letting the model answer from memory and look like it ignored
+    // the request.
+    onEvent?.({ type: 'system', text: wantsToolUse(userText)
+      ? `${modelKey} doesn't support tool-calling, so it can't run that tool — it will answer from memory only. Switch to a tools-capable model (e.g. qwen3:4b) to actually run it.`
+      : `${modelKey} doesn't support tool-calling — replying without tools.` });
   }
   const allTools = canUseTools ? await loadToolDefs().catch(() => null) : null;
   // Downgrade to the minimal profile for small models regardless of which
@@ -249,16 +285,43 @@ export async function runAgentTurn({ modelKey, systemPrompt, userText, priorMess
     const billions = await modelParamBillions(modelKey);
     if (billions != null && billions < 2) effectiveProfile = 'minimal';
   }
+  const explicitToolRequest = wantsToolUse(userText);
   let tools = allTools ? selectTools(allTools, effectiveProfile) : null;
+  // Skills declare their tool needs. Add those exact schemas after profile
+  // selection so Quick/minimal effort can never silently disable a slash skill.
+  if (tools && allTools && activated.skill?.tools?.length) {
+    const present = new Set(tools.map(t => t.function?.name));
+    tools = [...tools, ...allTools.filter(t => activated.skill.tools.includes(t.function?.name) && !present.has(t.function?.name))];
+  }
+  // The code/minimal profiles omit the web tools to keep the prompt small, so
+  // "search the web for X" on the Code surface previously had no web_search to
+  // call at all. When the prompt is plainly about the internet, add them back
+  // for this turn rather than making the model detour through tool_search.
+  if (tools && allTools && explicitToolRequest && WEB_INTENT.test(userText)) {
+    const present = new Set(tools.map(t => t.function?.name));
+    const missing = allTools.filter(t => WEB_TOOLS.includes(t.function?.name) && !present.has(t.function?.name));
+    if (missing.length) tools = [...tools, ...missing];
+  }
+  const hasWebTools = Boolean(tools?.some(t => t.function?.name === 'web_search'));
   if (tools && activeEffort >= 2 && activeEffort <= 3) tools = [...tools, EFFORT_ESCALATION_TOOL];
 
   // When tools are live, teach the model how to code well with them —
   // small local models won't infer this workflow on their own, and without
   // the cwd they don't know where relative paths land.
   let fullSystemPrompt = systemPrompt;
+  if (activated.skill) {
+    fullSystemPrompt += `\n\nActivated skill ${activated.skill.command}. These are trusted local workflow instructions; follow them for this turn regardless of thinking-effort level:\n${activated.skill.instructions}`;
+  }
   const effortConfig = EFFORT_LEVELS[activeEffort];
   fullSystemPrompt += `\n\nThinking effort: ${effortConfig.name} (${activeEffort}/4) — ${effortConfig.detail}.`;
-  if (activeEffort === 1) fullSystemPrompt += '\nAnswer directly. Avoid unnecessary planning or tool calls.';
+  // "Avoid unnecessary tool calls" is only safe when the user hasn't asked for
+  // one. Applied unconditionally it beat a 4B model into answering "search the
+  // web for X" from memory instead of calling web_search.
+  if (activeEffort === 1) {
+    fullSystemPrompt += (explicitToolRequest || activated.skill)
+      ? '\nAnswer concisely, but make the tool calls the request needs before answering.'
+      : '\nAnswer directly. Avoid unnecessary planning or tool calls.';
+  }
   if (activeEffort === 2) fullSystemPrompt += '\nThink through important details and verify the central result.';
   if (activeEffort === 3) fullSystemPrompt += '\nPlan before acting, inspect relevant context, and verify the result carefully.';
   if (activeEffort === 4) fullSystemPrompt += '\nUse maximum rigor: decompose the task, inspect evidence, test assumptions, and verify before answering.';
@@ -274,7 +337,15 @@ export async function runAgentTurn({ modelKey, systemPrompt, userText, priorMess
       + '- To change existing code: read_file first, then edit_file with an exact unique old_string. Only use write_file for brand-new files or full rewrites.\n'
       + '- To locate code: search_files (content grep) or find_files (filename glob) before guessing paths.\n'
       + '- After editing, verify when possible (read_file the changed region, or run_shell a quick check).\n'
-      + '- Chain as many tool calls as the task needs before answering.';
+      + (hasWebTools
+          ? '- To answer anything about the live internet — a person, company, product, event, price, news, or any fact you are not certain of — call web_search first, then scrape_url on a promising result for the full text. Answer from the results, and cite the URLs you used.\n'
+            + '- You DO have internet access through these tools. Never reply that you cannot browse, search, or access the web, and never ask the user to search for you.\n'
+          : '')
+      + '- Never restate, rephrase, or acknowledge the request instead of acting on it. Emit the tool call itself.\n'
+      + '- Chain as many tool calls as the task needs before answering.'
+      + (explicitToolRequest
+          ? '\n\nThe user has explicitly asked for tool work in this turn. Your FIRST action must be a tool call, not prose. If they named a tool, call that tool. Do not answer from memory.'
+          : '');
   }
   // No /no_think prefix: measured against qwen3:4b it does not suppress
   // reasoning (546-816 chars emitted regardless, whether placed in the system

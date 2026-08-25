@@ -34,6 +34,8 @@ static frontend cannot do on its own:
   POST /api/projects/settings                -> update project settings / duplicate / delete git
   POST /api/projects/git/action              -> run allowlisted git/github project actions
   GET  /api/tools/list                       -> the same TOOL_DEFINITIONS the Python agents use
+  GET  /api/skills/list                      -> installed, safe skill metadata
+  POST /api/skills                           -> add a local instruction-only skill
   POST /api/tools/call  {name, args}         -> execute one tool, for the GUI's chat tool-loop
   GET  /api/system/stats                     -> resource monitor: per-loaded-model + system CPU/RAM
   POST /api/services/start                   -> start ollama, pull only missing models, read config.py
@@ -581,6 +583,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_project_search(parse_qs(parsed.query))
         if parsed.path == '/api/tools/list':
             return self._handle_tools_list()
+        if parsed.path == '/api/skills/list':
+            return self._handle_skills_list()
         if parsed.path == '/api/system/stats':
             return self._handle_system_stats()
         if parsed.path == '/api/services/status':
@@ -647,6 +651,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_project_git_action()
         if parsed.path == '/api/tools/call':
             return self._handle_tools_call()
+        if parsed.path == '/api/skills':
+            return self._handle_skill_create()
         if parsed.path == '/api/runs/create':
             return self._handle_run_create()
         if parsed.path == '/api/runs/event':
@@ -960,6 +966,27 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_tools_list(self):
         from tools import TOOL_DEFINITIONS
         self._send_json({'tools': TOOL_DEFINITIONS})
+
+    def _handle_skills_list(self):
+        from tools.skills import list_skills
+        # Skill bodies are local reviewed instructions, not user-provided data.
+        # The shared chat loop needs them to fulfill an explicit /skill command.
+        self._send_json({'skills': list_skills(include_instructions=True)})
+
+    def _handle_skill_create(self):
+        from tools import TOOL_DEFINITIONS
+        from tools.skills import create_skill
+        body = self._read_json_body()
+        requested_tools = body.get('tools') if isinstance(body.get('tools'), list) else []
+        known_tools = {entry.get('function', {}).get('name') for entry in TOOL_DEFINITIONS}
+        unknown_tools = [str(tool) for tool in requested_tools if str(tool).strip() and str(tool).strip() not in known_tools]
+        if unknown_tools:
+            return self._send_json({'error': f"Unknown required tool(s): {', '.join(unknown_tools)}."}, 400)
+        try:
+            skill = create_skill(body.get('name'), body.get('description'), body.get('instructions'), requested_tools)
+        except ValueError as exc:
+            return self._send_json({'error': str(exc)}, 400)
+        self._send_json({'skill': skill}, 201)
 
     def _handle_tools_call(self):
         from tools import execute_tool

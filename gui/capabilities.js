@@ -91,6 +91,16 @@ export async function apiToolsList() {
   const res = await fetch(`${API}/api/tools/list`, { cache: 'no-store' });
   return readJsonResponse(res, `tools list failed (${res.status})`);
 }
+export async function apiSkillsList() {
+  const res = await fetch(`${API}/api/skills/list`, { cache: 'no-store' });
+  return readJsonResponse(res, `skills list failed (${res.status})`);
+}
+export async function apiSkillCreate(payload) {
+  const res = await fetch(`${API}/api/skills`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `add skill failed (${res.status})`);
+}
 export async function apiToolCall(name, args, context = {}) {
   const res = await fetch(`${API}/api/tools/call`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -421,6 +431,9 @@ export function getToolsEnabled() {
 }
 export function setToolsEnabled(enabled) {
   localStorage.setItem(TOOLS_ENABLED_KEY, String(enabled));
+  // The tools drawer shows whether tools can actually be called; without this
+  // it would keep claiming "Ready" after the toggle was switched off.
+  window.dispatchEvent(new CustomEvent('qh-tools-enabled-changed', { detail: { enabled: Boolean(enabled) } }));
 }
 
 export function getDirectory() {

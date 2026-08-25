@@ -213,6 +213,33 @@ h1 { margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -0.01em; }
 .run-card-actions { display: flex; gap: 6px; }
 .run-card-actions button { flex: 1; padding: 6px; border: 2px solid var(--border); background: var(--muted); color: var(--foreground); font: 700 10px var(--font-mono); cursor: pointer; }
 
+/* ── tools drawer ──────────────────────────────────────────────────────── */
+.tools-drawer { width: min(470px, 96vw); }
+.tools-status { margin-top: 14px; border: 2px solid var(--border); background: var(--card); padding: 9px 10px; }
+.tools-status p { margin: 0; font-size: 11px; line-height: 1.45; }
+.tools-status[data-state="warn"] { border-color: var(--accent); background: var(--muted); }
+.tools-filter { width: 100%; margin-top: 10px; padding: 8px 10px; border: 2px solid var(--border); background: var(--background); color: var(--foreground); font: 400 12px var(--font-mono); }
+.tools-filter:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+.tools-list { display: flex; flex-direction: column; gap: 16px; padding-top: 14px; }
+.tools-group { display: flex; flex-direction: column; gap: 6px; }
+.tools-group-head { display: flex; align-items: baseline; gap: 8px; padding-bottom: 5px; border-bottom: 2px solid var(--border); }
+.tools-group-head h3 { margin: 0; font: 700 11px var(--font-mono); text-transform: uppercase; letter-spacing: .06em; }
+.tools-group-head small { color: var(--muted-foreground); font-size: 10px; }
+.tool-row { display: flex; flex-direction: column; gap: 4px; width: 100%; padding: 9px 10px; border: 2px solid var(--border); background: var(--card); color: var(--foreground); text-align: left; cursor: pointer; }
+.tool-row:hover, .tool-row:focus-visible { background: var(--muted); }
+.tool-row:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+.tool-row.is-copied { background: var(--accent); color: var(--accent-foreground); }
+.tool-row.is-copied code, .tool-row.is-copied .tool-desc, .tool-row.is-copied .tool-arrow { color: inherit; }
+.tool-naming { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.tool-naming strong { font-size: 12px; }
+.tool-arrow { color: var(--muted-foreground); font-size: 11px; }
+.tool-naming code { border: 1px solid var(--border); padding: 1px 5px; font: 700 10px var(--font-mono); }
+.tool-desc { font-size: 11px; line-height: 1.4; color: var(--muted-foreground); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.tool-surfaces { display: flex; flex-wrap: wrap; gap: 4px; }
+.tool-surfaces em { border: 1px solid var(--border); padding: 0 4px; font: 400 9px var(--font-mono); font-style: normal; color: var(--muted-foreground); }
+.tool-surfaces em.is-absent { border-style: dashed; }
+@media (prefers-reduced-motion: reduce) { .tool-row { transition: none; } }
+
 .panel {
   border: 3px solid var(--border); background: var(--card); color: var(--card-foreground);
   padding: 16px; box-shadow: var(--shadow-offset-x) var(--shadow-offset-y) var(--shadow-blur) var(--shadow-spread) var(--shadow-color);
@@ -220,6 +247,24 @@ h1 { margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -0.01em; }
 .panel-head { margin-bottom: 12px; }
 .panel-head h2 { margin: 0; font-size: 14px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
 .panel-copy { margin: 4px 0 0; color: var(--muted-foreground); font-size: 12px; line-height: 1.45; }
+.skills-view { max-width: 1080px; width: 100%; }
+.skills-panel { min-height: 62vh; }
+.catalog-tabs { display: flex; gap: 8px; margin-bottom: 14px; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+.catalog-tabs .is-active { background: var(--primary); color: var(--primary-foreground); }
+.catalog-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 10px; }
+.catalog-list[hidden] { display: none; }
+.catalog-row { border: 2px solid var(--border); background: var(--secondary); padding: 12px; min-width: 0; }
+.catalog-row h3 { margin: 0; font-size: 12px; line-height: 1.35; }
+.catalog-row p { margin: 8px 0 0; color: var(--muted-foreground); font-size: 11px; line-height: 1.45; }
+.catalog-row small { display: block; margin-top: 8px; font: 700 9px var(--font-mono); color: var(--primary); overflow-wrap: anywhere; }
+.add-skill { margin: 0 0 14px; border: 2px solid var(--border); background: var(--secondary); }
+.add-skill summary { cursor: pointer; padding: 10px 12px; font-size: 12px; font-weight: 800; text-transform: uppercase; }
+.add-skill-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 0 12px 12px; }
+.add-skill-upload, .add-skill-form .field:nth-child(4), .add-skill-form .field:nth-child(5), .add-skill-actions { grid-column: 1 / -1; }
+.add-skill-upload small { color: var(--muted-foreground); font-size: 10px; font-weight: 500; letter-spacing: 0; text-transform: none; }
+.add-skill-form textarea { width: 100%; resize: vertical; font: 12px var(--font-mono); padding: 8px 9px; border: 2px solid var(--border); background: var(--card); color: var(--card-foreground); }
+.add-skill-actions { display: flex; align-items: center; gap: 10px; }
+.add-skill-actions .panel-copy { margin: 0; }
 
 .field { display: flex; flex-direction: column; gap: 5px; font-size: 10px; color: var(--muted-foreground); font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
 .field input, .field select { font: inherit; padding: 8px 9px; border: 2px solid var(--border); background: var(--card); color: var(--card-foreground); }
