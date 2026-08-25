@@ -47,6 +47,10 @@
         <h1 id="route-title">Home</h1>
       </div>
       <div class="topbar-status">
+        <button id="services-toggle" class="services-toggle" type="button" data-state="idle" title="Run setup.sh and config.py">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="services-label">Start services</span>
+        </button>
         <button id="activity-toggle" class="activity-toggle" type="button" aria-expanded="false" title="Open activity">
           Activity <span id="activity-count">0</span>
         </button>
@@ -510,6 +514,19 @@
   <div id="activity-list" class="activity-list">
     <p class="transcript-empty">No runs yet.</p>
   </div>
+</aside>
+
+<aside class="activity-drawer" id="services-drawer" hidden aria-label="Service startup log">
+  <div class="activity-drawer-head">
+    <div>
+      <span class="eyebrow">setup.sh + config.py</span>
+      <h2>Services</h2>
+    </div>
+    <button id="services-close" class="icon-button" type="button" title="Close services log" aria-label="Close services log">×</button>
+  </div>
+  <p class="services-step" id="services-step">Not started.</p>
+  <button id="services-run" class="services-run" type="button">Start services</button>
+  <pre class="services-log" id="services-log" aria-live="polite">setup.sh installs Ollama, pulls the model roster, and installs the Python deps. This takes several minutes on a cold machine.</pre>
 </aside>
 
 <div id="selection-actions" class="selection-actions" hidden role="toolbar" aria-label="Selected text actions">

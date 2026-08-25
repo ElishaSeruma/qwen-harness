@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:qwen-harness}",
+            "name": "Debug QwenHarnessDesktop",
+            "target": "QwenHarnessDesktop",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug QwenHarnessDesktop"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:qwen-harness}",
+            "name": "Release QwenHarnessDesktop",
+            "target": "QwenHarnessDesktop",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release QwenHarnessDesktop"
+        }
+    ]
+}

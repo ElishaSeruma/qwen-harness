@@ -110,6 +110,18 @@ export async function apiSystemStats() {
   return readJsonResponse(res, `system stats failed (${res.status})`);
 }
 
+// ── Start services (setup.sh + config.py) ───────────────────────────────
+// setup.sh runs for minutes, so start kicks off a background job on the
+// server and status is polled until it settles.
+export async function apiServicesStart() {
+  const res = await fetch(`${API}/api/services/start`, { method: 'POST' });
+  return readJsonResponse(res, `start services failed (${res.status})`);
+}
+export async function apiServicesStatus() {
+  const res = await fetch(`${API}/api/services/status`, { cache: 'no-store' });
+  return readJsonResponse(res, `services status failed (${res.status})`);
+}
+
 // ── Durable runs ────────────────────────────────────────────────────────
 export async function apiRuns(projectId = null, limit = 50) {
   const params = new URLSearchParams({ limit: String(limit) });

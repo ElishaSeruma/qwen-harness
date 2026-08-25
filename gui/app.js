@@ -18,6 +18,7 @@ import {
 } from './chats.js';
 import {
   apiListDir, apiReadFile, apiWriteFile, apiExec, apiHealth, apiSystemStats,
+  apiServicesStart, apiServicesStatus,
   apiFsGrants, apiFsGrant, apiCreateFile, apiCreateDir, apiMovePath, apiDeletePath,
   apiProjects, apiProjectCreate, apiProjectAddDocs, apiProjectReadDoc, apiProjectDeleteDoc, apiProjectRenameDoc,
   apiProjectIndex, apiProjectSearch, apiProjectPublishGithub, apiProjectGitAction, apiProjectDelete, apiProjectSettings,
@@ -3244,6 +3245,79 @@ async function pollOllama() {
   }
 }
 
+// ── start services (setup.sh + config.py) ───────────────────────────────
+// Lives in the topbar next to Activity, so it is reachable from every route,
+// not just Home. setup.sh runs for minutes; the server owns the job and this
+// only reflects its state.
+const SERVICES_LABELS = {
+  idle: 'Start services',
+  running: 'Starting services…',
+  done: 'Services ready',
+  failed: 'Services failed',
+};
+
+function renderServices(status) {
+  const btn = $('#services-toggle');
+  const state = status?.state || 'idle';
+  btn.dataset.state = state;
+  $('#services-label').textContent = state === 'running' && status.step
+    ? `Running ${status.step}…`
+    : SERVICES_LABELS[state];
+
+  const run = $('#services-run');
+  run.disabled = state === 'running';
+  run.textContent = state === 'done' || state === 'failed' ? 'Run again' : 'Start services';
+
+  const step = $('#services-step');
+  if (state === 'running') step.textContent = `Running ${status.step || '…'}`;
+  else if (state === 'done') step.textContent = status.active_model ? `Ready · ACTIVE_MODEL ${status.active_model}` : 'Ready.';
+  else if (state === 'failed') step.textContent = status.error || 'Failed.';
+  else step.textContent = 'Not started.';
+
+  const log = $('#services-log');
+  if (status?.log?.length) {
+    // Only repaint when the tail actually changed, so the user can scroll back
+    // through a long ollama pull without being yanked to the bottom each poll.
+    const text = status.log.join('\n');
+    if (log.textContent !== text) {
+      const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+      log.textContent = text;
+      if (pinned) log.scrollTop = log.scrollHeight;
+    }
+  }
+}
+
+let servicesStatus = null;
+async function pollServices() {
+  try {
+    servicesStatus = await apiServicesStatus();
+    renderServices(servicesStatus);
+  } catch { /* backend offline — pollBackend already reports that */ }
+}
+
+function setServicesDrawer(open) {
+  $('#services-drawer').hidden = !open;
+  if (open) pollServices();
+}
+$('#services-close').addEventListener('click', () => setServicesDrawer(false));
+
+async function startServices() {
+  try {
+    servicesStatus = await apiServicesStart();
+    renderServices(servicesStatus);
+    if (servicesStatus.already_running) showToast('Services are already starting.', { kind: 'notice' });
+  } catch (err) {
+    showToast(err.message || 'Could not start services.');
+  }
+}
+$('#services-run').addEventListener('click', startServices);
+$('#services-toggle').addEventListener('click', () => {
+  setServicesDrawer(true);
+  // A click while a run is in flight is a request to watch it, not to start a
+  // second one (the server refuses that anyway).
+  if (servicesStatus?.state !== 'running') startServices();
+});
+
 // ── resource monitor (Home) ─────────────────────────────────────────────
 function pctFillClass(pct) {
   return pct >= 80 ? 'is-hot' : '';
@@ -3305,6 +3379,7 @@ await refreshProjects();
 await loadCodeTree(getDirectory() || '.');
 pollBackend(); pollOllama(); pollResourceMonitor();
 refreshActivity();
+pollServices();
 
 // Polling discipline. Previously five timers fired unconditionally, with no
 // in-flight guard — a slow endpoint stacked duplicate requests until the
@@ -3344,6 +3419,10 @@ schedulePoll('resources', pollResourceMonitor, 5000);
 // The activity drawer rebuilds up to 40 cards from a ~22KB payload — pointless
 // while the drawer is closed.
 schedulePoll('activity', refreshActivity, 5000);
+// setup.sh output only moves while it runs; once it settles there is nothing
+// to poll for unless the user is watching the log.
+schedulePoll('services', pollServices, 2000,
+  () => servicesStatus?.state === 'running' || !$('#services-drawer').hidden);
 // Projects are shared, on-disk state (~/.qwen-harness/projects.json) that
 // any client (this browser tab, another tab, the Mac app) can mutate — so
 // while the Projects view is open, poll for changes made elsewhere instead
@@ -3356,6 +3435,7 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   pollBackend(); pollOllama(); pollResourceMonitor();
   refreshActivity();
+  if (servicesStatus?.state === 'running' || !$('#services-drawer').hidden) pollServices();
   if (!$('#view-projects').hidden) refreshProjects();
 });
 switchRoute(localStorage.getItem(ROUTE_KEY) || 'home');

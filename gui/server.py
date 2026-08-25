@@ -36,6 +36,8 @@ static frontend cannot do on its own:
   GET  /api/tools/list                       -> the same TOOL_DEFINITIONS the Python agents use
   POST /api/tools/call  {name, args}         -> execute one tool, for the GUI's chat tool-loop
   GET  /api/system/stats                     -> resource monitor: per-loaded-model + system CPU/RAM
+  POST /api/services/start                   -> run setup.sh then config.py in the background
+  GET  /api/services/status                  -> {state, step, log[]} for that background job
   GET  /api/supabase/status                  -> {connected, url} (never the key)
   POST /api/supabase/connect {url, service_role_key} -> validate + store Supabase creds locally
   POST /api/supabase/disconnect              -> forget stored Supabase creds
@@ -138,6 +140,91 @@ CONTENT_TYPES = {
     '.txt': 'text/plain; charset=utf-8', '.md': 'text/plain; charset=utf-8',
     '.cjs': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
 }
+
+# ── "Start services" job ──────────────────────────────────────────────────
+# setup.sh pulls ~7 GB of models and installs pip/playwright deps, so it runs
+# for many minutes — far past EXEC_TIMEOUT_S. It therefore runs in a background
+# thread that streams its output into a bounded log buffer, and the GUI polls
+# /api/services/status instead of holding a request open.
+SERVICES_LOCK = threading.RLock()
+SERVICES_LOG_LINES = 400   # ring buffer; the GUI only ever shows a tail
+SERVICES_STEPS = ('setup.sh', 'config.py')
+SERVICES_STATE = {
+    'state': 'idle',       # idle | running | done | failed
+    'step': None,          # which of SERVICES_STEPS is executing
+    'started_at': None,
+    'finished_at': None,
+    'code': None,          # exit code of the failing/last step
+    'error': None,
+    'active_model': None,  # ACTIVE_MODEL, as reported by config.py
+    'log': [],
+}
+
+
+def _services_log(line):
+    with SERVICES_LOCK:
+        SERVICES_STATE['log'].append(line)
+        if len(SERVICES_STATE['log']) > SERVICES_LOG_LINES:
+            del SERVICES_STATE['log'][:-SERVICES_LOG_LINES]
+
+
+def _services_run_step(step, argv):
+    """Run one step, streaming stdout+stderr into the log. Returns exit code."""
+    with SERVICES_LOCK:
+        SERVICES_STATE['step'] = step
+    _services_log(f'── {step} ──────────────────────────────────────')
+    try:
+        proc = subprocess.Popen(
+            argv, cwd=str(REPO_ROOT), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+    except OSError as exc:
+        _services_log(f'! could not start {step}: {exc}')
+        return 127
+    for line in proc.stdout:
+        _services_log(line.rstrip('\n'))
+    return proc.wait()
+
+
+# config.py is a module of constants, not a CLI — executing it plainly prints
+# nothing. runpy executes it exactly as a script would and then lets us report
+# the registry it defines, which is the part that is actually worth seeing.
+_CONFIG_RUNNER = (
+    'import runpy;'
+    'ns = runpy.run_path("config.py");'
+    'print("ACTIVE_MODEL=" + ns["ACTIVE_MODEL"]);'
+    'print("models: " + ", ".join(ns["MODELS"]))'
+)
+
+
+def _services_worker():
+    try:
+        for step in SERVICES_STEPS:
+            argv = ['bash', 'setup.sh'] if step == 'setup.sh' else [sys.executable, '-c', _CONFIG_RUNNER]
+            code = _services_run_step(step, argv)
+            if code != 0:
+                with SERVICES_LOCK:
+                    SERVICES_STATE.update(state='failed', code=code,
+                                          error=f'{step} exited with code {code}')
+                _services_log(f'✗ {step} failed (exit {code})')
+                return
+            if step == 'config.py':
+                active = next((l.split('=', 1)[1] for l in reversed(SERVICES_STATE['log'])
+                               if l.startswith('ACTIVE_MODEL=')), None)
+                with SERVICES_LOCK:
+                    SERVICES_STATE['active_model'] = active
+        with SERVICES_LOCK:
+            SERVICES_STATE.update(state='done', code=0, step=None)
+        _services_log('✅ services started')
+    except Exception as exc:  # a worker thread dying silently would hang the pill on "running"
+        with SERVICES_LOCK:
+            SERVICES_STATE.update(state='failed', error=str(exc))
+        _services_log(f'! {exc}')
+    finally:
+        with SERVICES_LOCK:
+            SERVICES_STATE['finished_at'] = time.time()
+            if SERVICES_STATE['state'] == 'running':
+                SERVICES_STATE.update(state='failed', error='worker ended unexpectedly')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -366,6 +453,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_tools_list()
         if parsed.path == '/api/system/stats':
             return self._handle_system_stats()
+        if parsed.path == '/api/services/status':
+            return self._handle_services_status()
         if parsed.path == '/api/runs':
             return self._handle_runs_list(parsed)
         if parsed.path == '/api/runs/events':
@@ -402,6 +491,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_delete()
         if parsed.path == '/api/exec':
             return self._handle_exec()
+        if parsed.path == '/api/services/start':
+            return self._handle_services_start()
         if parsed.path == '/api/github/connect':
             return self._handle_github_connect()
         if parsed.path == '/api/github/disconnect':
@@ -907,6 +998,31 @@ class Handler(BaseHTTPRequestHandler):
     # for per-task CPU/RAM. With OLLAMA_NUM_PARALLEL=1 (this project's
     # default) there's normally at most one llama-server per loaded model,
     # so list-order pairing is reliable; it's a best-effort match otherwise.
+    # ── start services (setup.sh + config.py) ────────────────────────────
+    def _handle_services_start(self):
+        with SERVICES_LOCK:
+            if SERVICES_STATE['state'] == 'running':
+                # Already in flight — report progress rather than starting a
+                # second setup.sh racing the first over the same ollama pulls.
+                return self._send_json({'ok': True, 'already_running': True, **self._services_snapshot()})
+            SERVICES_STATE.update(
+                state='running', step=SERVICES_STEPS[0], started_at=time.time(),
+                finished_at=None, code=None, error=None, log=[],
+            )
+        threading.Thread(target=_services_worker, name='start-services', daemon=True).start()
+        with SERVICES_LOCK:
+            return self._send_json({'ok': True, 'already_running': False, **self._services_snapshot()})
+
+    def _services_snapshot(self):
+        """Caller must hold SERVICES_LOCK. Copies the log so it can't mutate mid-encode."""
+        snap = dict(SERVICES_STATE)
+        snap['log'] = list(SERVICES_STATE['log'])
+        return snap
+
+    def _handle_services_status(self):
+        with SERVICES_LOCK:
+            self._send_json({'ok': True, **self._services_snapshot()})
+
     def _handle_system_stats(self):
         import urllib.request
 
