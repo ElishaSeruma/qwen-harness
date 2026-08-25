@@ -39,6 +39,36 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertTrue(result["permission_required"])
         self.assertIn("secret-file", result["error"])
 
+    def test_granted_roots_returns_a_fresh_list(self):
+        # gui/server.py does `roots = _load_grants(); roots.append(...)` in
+        # three places. If the cache handed back its own sequence, those
+        # appends would silently corrupt it for every later caller.
+        first = policy.granted_roots()
+        first.append(Path("/tmp/definitely-not-granted"))
+        self.assertNotIn(Path("/tmp/definitely-not-granted"), policy.granted_roots())
+
+    def test_new_grant_is_visible_after_write(self):
+        # A directory granted at runtime must take effect immediately, not
+        # after the cache TTL expires.
+        extra = self.root / "granted-later"
+        extra.mkdir()
+        self.assertTrue(policy.is_granted(self.root))
+        policy.granted_roots()  # prime the cache
+        policy.atomic_write_json(self.permissions, {"roots": [str(self.root), str(extra)]})
+        self.assertIn(extra.resolve(), policy.granted_roots())
+
+    def test_revoked_grant_stops_being_granted(self):
+        # The dangerous staleness direction: a cache must never keep allowing
+        # a path after it is revoked.
+        outside = Path(tempfile.mkdtemp()).resolve()
+        try:
+            policy.atomic_write_json(self.permissions, {"roots": [str(self.root), str(outside)]})
+            self.assertTrue(policy.is_granted(outside))
+            policy.atomic_write_json(self.permissions, {"roots": [str(self.root)]})
+            self.assertFalse(policy.is_granted(outside))
+        finally:
+            outside.rmdir()
+
     def test_shell_executes_in_explicit_working_directory(self):
         result = files.run_shell("pwd", cwd=str(self.root))
         self.assertEqual(result["returncode"], 0)

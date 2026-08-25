@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -43,9 +45,47 @@ def atomic_write_json(path: Path, payload: Any, mode: int = 0o600) -> None:
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
+    # Any write to the permissions file must drop the cached roots, or a
+    # freshly granted (or revoked) directory would not take effect until the
+    # TTL expired. Cheap and unconditional beats remembering at each caller.
+    if path == PERMISSIONS_PATH:
+        invalidate_grants()
 
 
-def granted_roots() -> list[Path]:
+# Grants are consulted on every path check — 35 call sites in gui/server.py
+# alone, several of them per request — and each check previously re-read and
+# re-resolved permissions.json from disk. Cache the resolved roots, keyed on
+# the file's identity so it self-invalidates when the file changes.
+#
+# Security properties this cache must preserve:
+#  - It caches the ROOTS LIST ONLY, never a per-path allow/deny decision, so
+#    each path is still resolved and matched fresh (no symlink-swap window).
+#  - The key includes the path string and inode, because tests/test_policy.py
+#    monkeypatches PERMISSIONS_PATH to a fresh temp file per test — an
+#    mtime-only key could collide across them.
+#  - A TTL ceiling bounds staleness even on filesystems with coarse mtime.
+#  - Any stat error falls through to a full read: it fails CLOSED, never
+#    serving a stale allow.
+_GRANTS_LOCK = threading.RLock()
+_GRANTS_CACHE: dict[str, Any] = {"key": None, "roots": (), "at": 0.0}
+_GRANTS_TTL_S = 1.0
+
+
+def _grants_cache_key() -> tuple:
+    try:
+        st = PERMISSIONS_PATH.stat()
+        return (str(PERMISSIONS_PATH), st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (str(PERMISSIONS_PATH), None, None, None)
+
+
+def invalidate_grants() -> None:
+    """Drop the cached roots. Call after any write to permissions.json."""
+    with _GRANTS_LOCK:
+        _GRANTS_CACHE["key"] = None
+
+
+def _read_granted_roots() -> tuple[Path, ...]:
     roots = {REPO_ROOT}
     try:
         payload = json.loads(PERMISSIONS_PATH.read_text(encoding="utf-8"))
@@ -60,7 +100,24 @@ def granted_roots() -> list[Path]:
                 resolved.append(candidate)
         except OSError:
             continue
-    return sorted(set(resolved), key=str)
+    return tuple(sorted(set(resolved), key=str))
+
+
+def granted_roots() -> list[Path]:
+    """Directories the harness is allowed to touch. Returns a fresh list.
+
+    Callers in gui/server.py mutate the result (`roots.append(...)` before
+    saving), so this must never hand back the cached sequence itself.
+    """
+    now = time.monotonic()
+    key = _grants_cache_key()
+    with _GRANTS_LOCK:
+        if _GRANTS_CACHE["key"] == key and (now - _GRANTS_CACHE["at"]) < _GRANTS_TTL_S:
+            return list(_GRANTS_CACHE["roots"])
+    roots = _read_granted_roots()
+    with _GRANTS_LOCK:
+        _GRANTS_CACHE.update({"key": key, "roots": roots, "at": now})
+    return list(roots)
 
 
 def resolve_path(raw_path: str | Path, cwd: str | Path | None = None) -> Path:

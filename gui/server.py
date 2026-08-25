@@ -71,7 +71,13 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))  # so `tools.*` importable, matching the Python agents
-from tools.policy import atomic_write_json, is_secret_path
+from tools.policy import (
+    atomic_write_json,
+    granted_roots as policy_granted_roots,
+    invalidate_grants,
+    is_granted as policy_is_granted,
+    is_secret_path,
+)
 
 MAX_READ_BYTES = 3 * 1024 * 1024  # 3MB cap so the browser doesn't choke
 EXEC_TIMEOUT_S = 30
@@ -181,41 +187,27 @@ class Handler(BaseHTTPRequestHandler):
         return Path(cleaned).expanduser().resolve()
 
     def _load_grants(self):
-        roots = {str(REPO_ROOT)}
-        try:
-            if PERMISSIONS_PATH.exists():
-                data = json.loads(PERMISSIONS_PATH.read_text(encoding='utf-8'))
-                roots.update(data.get('roots', []))
-        except (OSError, json.JSONDecodeError):
-            pass
-        valid = []
-        for root in roots:
-            try:
-                path = Path(root).expanduser().resolve()
-                if path.exists() and path.is_dir():
-                    valid.append(str(path))
-            except OSError:
-                continue
-        return sorted(set(valid))
+        # Delegates to tools/policy.py so the HTTP path and the agent-tool
+        # path share one implementation AND one cache. Previously each had its
+        # own copy, so caching either side alone still left the other reading
+        # permissions.json from disk on every check.
+        # Returns list[str] — callers here mutate it and JSON-serialize it.
+        return [str(p) for p in policy_granted_roots()]
 
     def _save_grants(self, roots):
         atomic_write_json(PERMISSIONS_PATH, {'roots': sorted(set(roots))})
+        # atomic_write_json already invalidates for this path; explicit here so
+        # a future revoke endpoint can't forget to.
+        invalidate_grants()
 
     def _is_granted(self, path):
+        # policy.is_granted does not resolve its argument, so the resolve
+        # (with the OSError fallback) stays here.
         try:
             resolved = path.resolve()
         except OSError:
             resolved = path
-        for root in self._load_grants():
-            root_path = Path(root)
-            if resolved == root_path:
-                return True
-            try:
-                resolved.relative_to(root_path)
-                return True
-            except ValueError:
-                continue
-        return False
+        return policy_is_granted(resolved)
 
     def _require_grant(self, path):
         if self._is_granted(path):
