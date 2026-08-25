@@ -160,6 +160,18 @@ function showToast(message, { kind = 'error', suggestion = null, timeoutMs = 900
   while (stack.children.length > 4) stack.firstElementChild.remove();
   setTimeout(() => toast.remove(), timeoutMs);
 }
+// Persist a completed turn. Detached from the reply path (the user should
+// never wait on Supabase), but internally ORDERED: sb_get_messages orders by
+// created_at, so firing the user and assistant inserts in parallel can make a
+// replayed conversation come back with the answer before the question.
+function persistTurn(chatId, userText, assistantText, title) {
+  if (!chatId) return;
+  persistMessage(chatId, 'user', userText)
+    .then(() => persistMessage(chatId, 'assistant', assistantText))
+    .then(() => touchChat(chatId, title))
+    .catch(err => console.warn('[chats] failed to persist turn:', err?.message || err));
+}
+
 // Shared approval handler for gated tools (write/edit/shell/computer).
 // Honours the Auto-approve toggle and per-scope session grants so an agent
 // can chain many edits without a modal per step, while still asking once
@@ -895,9 +907,9 @@ async function sendHomeMessage() {
           appendEntry(agent, ev);
         },
       });
-      persistMessage(chatId, 'user', fullText);
-      persistMessage(chatId, 'assistant', reply);
-      touchChat(chatId, fullText.slice(0, 80));
+      // Chained, not fired in parallel: sb_get_messages orders by created_at,
+      // so two simultaneous inserts can replay out of order.
+      persistTurn(chatId, fullText, reply, fullText.slice(0, 80));
       const entry = { type: 'assistant', text: reply || '(empty response)' };
       clearStreamingMessage($('#home-feed'), `${run.id}:${agent.id}`);
       homeFeedAppend(agent.name, entry);
@@ -1880,9 +1892,7 @@ $('#code-composer').addEventListener('submit', async (e) => {
         appendCodeEntry(ev);
       },
     });
-    persistMessage(chatId, 'user', text);
-    persistMessage(chatId, 'assistant', content);
-    touchChat(chatId, text.slice(0, 80));
+    persistTurn(chatId, text, content, text.slice(0, 80));
     clearStreamingMessage($('#code-transcript'), run.id);
     appendCodeEntry({ type: 'assistant', text: content || '(empty response)' });
     await finishRun(run.id, content);
@@ -2551,9 +2561,7 @@ async function sendProjectMessage() {
           appendEntry(agent, ev);
         },
       });
-      persistMessage(chatId, 'user', text);
-      persistMessage(chatId, 'assistant', reply);
-      touchChat(chatId, `[${project.name}] ${text.slice(0, 70)}`);
+      persistTurn(chatId, text, reply, `[${project.name}] ${text.slice(0, 70)}`);
       const entry = { type: 'assistant', text: reply || '(empty response)' };
       clearStreamingMessage($('#project-main-feed'), `${run.id}:${agent.id}`);
       appendProjectMainFeed(project, agent.name, entry);

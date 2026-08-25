@@ -14,6 +14,33 @@ import { getModelContextLimit } from './agent-loop.js';
 const ACTIVE_CHATS_KEY = 'qh-active-chats-v1'; // agentId -> chatId
 const COMPACTION_THRESHOLD = 0.75;
 
+// The context the SERVER actually runs with (OLLAMA_CONTEXT_LENGTH in
+// wake-up.sh and main.swift), not what a model advertises. qwen3:4b claims
+// 262144, so compaction was triggering at ~196k tokens — i.e. never, while
+// every turn silently overflowed the real 8192 window instead.
+// Keep this in sync with OLLAMA_CONTEXT_LENGTH.
+const EFFECTIVE_CONTEXT_TOKENS = 8192;
+
+// Replay caps. One tool-result-laden message can be enormous, so bound by
+// characters as well as count. ~16k chars is roughly 4k tokens, which leaves
+// room for tools + system prompt + the reply inside 8192.
+const MAX_REPLAY_MESSAGES = 20;
+const MAX_REPLAY_CHARS = 16000;
+
+/** Keep the most recent messages that fit both caps, oldest-first. */
+function capMessages(messages) {
+  const kept = [];
+  let chars = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    const len = (m.content || '').length;
+    if (kept.length >= MAX_REPLAY_MESSAGES || chars + len > MAX_REPLAY_CHARS) break;
+    kept.push(m);
+    chars += len;
+  }
+  return kept.reverse();
+}
+
 let supabaseConnected = null;
 export async function isSupabaseConnected() {
   if (supabaseConnected === null) {
@@ -71,8 +98,11 @@ export async function trackUsageAndMaybeCompact(chatId, modelKey, totalTokens, s
   if (!chatId) return;
   try { await apiChatTokens(chatId, totalTokens); } catch { /* best-effort */ }
 
-  const contextLimit = await getModelContextLimit(modelKey);
-  if (!contextLimit || totalTokens < contextLimit * COMPACTION_THRESHOLD) return;
+  // Clamp to the real server context — the advertised number is what made
+  // this condition unreachable.
+  const advertised = await getModelContextLimit(modelKey);
+  const contextLimit = Math.min(advertised ?? EFFECTIVE_CONTEXT_TOKENS, EFFECTIVE_CONTEXT_TOKENS);
+  if (totalTokens < contextLimit * COMPACTION_THRESHOLD) return;
 
   try {
     const { messages } = await apiChatMessages(chatId);
@@ -93,17 +123,27 @@ export async function trackUsageAndMaybeCompact(chatId, modelKey, totalTokens, s
 export async function buildPriorMessages(chatId) {
   if (!chatId) return [];
   try {
-    const { compaction } = await apiChatCompaction(chatId);
-    const { messages } = await apiChatMessages(chatId);
+    // Independent calls — allSettled rather than all, so a failed compaction
+    // lookup degrades to "full (capped) history" instead of discarding a
+    // perfectly good message list and returning no continuity at all.
+    const [compactionResult, messagesResult] = await Promise.allSettled([
+      apiChatCompaction(chatId),
+      apiChatMessages(chatId),
+    ]);
+    if (messagesResult.status !== 'fulfilled') return [];
+    const messages = (messagesResult.value.messages || []).filter(m => m.content);
+    const compaction = compactionResult.status === 'fulfilled' ? compactionResult.value.compaction : null;
+
     if (compaction) {
       const idx = messages.findIndex(m => m.id === compaction.covers_up_to_message_id);
-      const recent = idx >= 0 ? messages.slice(idx + 1) : messages.slice(-10);
+      const recent = idx >= 0 ? messages.slice(idx + 1) : messages;
       return [
         { role: 'system', content: `Earlier conversation summary: ${compaction.summary_text}` },
-        ...recent.filter(m => m.content).map(m => ({ role: m.role, content: m.content })),
+        ...capMessages(recent).map(m => ({ role: m.role, content: m.content })),
       ];
     }
-    return messages.filter(m => m.content).map(m => ({ role: m.role, content: m.content }));
+    // Previously unbounded: a long chat replayed its ENTIRE history every turn.
+    return capMessages(messages).map(m => ({ role: m.role, content: m.content }));
   } catch { return []; }
 }
 
