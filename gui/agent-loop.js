@@ -10,6 +10,10 @@ import { apiToolsList, apiToolCall, getToolsEnabled } from './capabilities.js';
 import { EFFORT_LEVELS, parseEffortEscalation } from './effort.js';
 
 const OLLAMA_URL = 'http://localhost:11434/v1/chat/completions';
+// Hard ceiling on elapsed time for one turn, independent of the token budget.
+// Token budgets don't bound wall-clock: at qwen3:4b's measured 7.3 tok/s, Max
+// effort (6144 tokens x 18 iterations) is ~2.8 hours.
+const DEFAULT_DEADLINE_MS = 10 * 60 * 1000;
 const EFFORT_ESCALATION_TOOL = {
   type: 'function',
   function: {
@@ -33,7 +37,7 @@ async function streamCompletion(body, signal, onToken) {
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '', content = '', usage = null;
+  let buffer = '', content = '', reasoning = '', usage = null;
   const calls = new Map();
   while (true) {
     const { value, done } = await reader.read();
@@ -53,6 +57,10 @@ async function streamCompletion(body, signal, onToken) {
         content += delta.content;
         onToken?.(content, delta.content);
       }
+      // qwen3 routes chain-of-thought to `reasoning`, leaving `content` empty
+      // when the token budget runs out mid-thought. Capture it so the turn
+      // isn't wasted (see reasoning fallback below).
+      if (delta.reasoning) reasoning += delta.reasoning;
       for (const part of delta.tool_calls || []) {
         const index = part.index ?? calls.size;
         const current = calls.get(index) || { id: '', type: 'function', function: { name: '', arguments: '' } };
@@ -63,7 +71,7 @@ async function streamCompletion(body, signal, onToken) {
       }
     }
   }
-  return { choices: [{ message: { role: 'assistant', content, tool_calls: calls.size ? [...calls.values()] : undefined } }], usage };
+  return { choices: [{ message: { role: 'assistant', content, reasoning, tool_calls: calls.size ? [...calls.values()] : undefined } }], usage };
 }
 
 let toolDefsPromise = null;
@@ -225,7 +233,7 @@ function stripThink(text) {
  *   user turn.
  * @returns {Promise<string>} the final assistant reply text
  */
-export async function runAgentTurn({ modelKey, systemPrompt, userText, priorMessages = [], cwd = null, toolProfile = 'home', signal = null, runId = null, onEvent, onToken, onApprovalRequest, onEffortEscalation, toolsEnabled = null, effort = 1 }) {
+export async function runAgentTurn({ modelKey, systemPrompt, userText, priorMessages = [], cwd = null, toolProfile = 'home', deadlineMs = DEFAULT_DEADLINE_MS, signal = null, runId = null, onEvent, onToken, onApprovalRequest, onEffortEscalation, toolsEnabled = null, effort = 1 }) {
   let activeEffort = Math.max(1, Math.min(4, Number(effort) || 1));
   const wantsTools = toolsEnabled == null ? getToolsEnabled() : Boolean(toolsEnabled);
   const canUseTools = wantsTools && await modelSupportsTools(modelKey);
@@ -268,13 +276,28 @@ export async function runAgentTurn({ modelKey, systemPrompt, userText, priorMess
       + '- After editing, verify when possible (read_file the changed region, or run_shell a quick check).\n'
       + '- Chain as many tool calls as the task needs before answering.';
   }
+  // No /no_think prefix: measured against qwen3:4b it does not suppress
+  // reasoning (546-816 chars emitted regardless, whether placed in the system
+  // prompt, the user turn, or via chat_template_kwargs). It only added noise
+  // to every prompt. Thinking is controlled by the `think` option below.
   const messages = [
-    { role: 'system', content: `${activeEffort >= 3 ? '/think' : '/no_think'}\n\n${fullSystemPrompt}` },
+    { role: 'system', content: fullSystemPrompt },
     ...priorMessages,
     { role: 'user', content: userText },
   ];
 
+  // Wall-clock budget. Token budgets alone don't bound elapsed time: at
+  // qwen3:4b's measured 7.3 tok/s, Max effort (6144 tokens x 18 iterations)
+  // is ~2.8 hours. Stop and return partial work instead of hanging.
+  const deadline = Date.now() + deadlineMs;
+  let lastAssistantText = '';
   for (let i = 0; i < EFFORT_LEVELS[activeEffort].toolIterations; i++) {
+    if (Date.now() > deadline) {
+      const mins = Math.round(deadlineMs / 60000);
+      onEvent?.({ type: 'system', text: `Stopped after ${mins} min time budget. Ask again to continue.` });
+      return lastAssistantText
+        || `(stopped after the ${mins} minute time budget — the model was still working. Try a smaller/faster model, or ask again to continue.)`;
+    }
     const currentConfig = EFFORT_LEVELS[activeEffort];
     const data = await streamCompletion({
         model: modelKey,
@@ -286,6 +309,7 @@ export async function runAgentTurn({ modelKey, systemPrompt, userText, priorMess
       }, signal, onToken);
     const message = data.choices?.[0]?.message;
     if (!message) throw new Error('No response from model');
+    if (message.content?.trim()) lastAssistantText = stripThink(message.content);
 
     let toolCalls = message.tool_calls;
     if ((!toolCalls || toolCalls.length === 0) && tools) {
@@ -306,7 +330,18 @@ export async function runAgentTurn({ modelKey, systemPrompt, userText, priorMess
         continue;
       }
       if (data.usage?.total_tokens != null) onEvent?.({ type: 'usage', totalTokens: data.usage.total_tokens });
-      return stripThink(message.content);
+      const answer = stripThink(message.content);
+      if (answer) return answer;
+      // Thinking models (qwen3) put chain-of-thought in `reasoning` and the
+      // answer in `content`. When the token budget runs out mid-thought,
+      // content is empty and the whole turn was previously discarded as
+      // "(empty response)". Surface the reasoning rather than losing the work.
+      const thought = stripThink(message.reasoning || '');
+      if (thought) {
+        onEvent?.({ type: 'system', text: `${modelKey} ran out of token budget while reasoning — showing its working.` });
+        return thought;
+      }
+      return answer;
     }
 
     messages.push({ role: 'assistant', content: message.content || '', tool_calls: toolCalls });

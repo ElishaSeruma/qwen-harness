@@ -54,6 +54,15 @@ MODELS: dict[str, ModelConfig] = {
         base_url="http://localhost:11434/v1",
         api_key="ollama",
     ),
+    # The default llama3.2:1b tag is Q8_0 (~1.3 GB) while everything else here
+    # is Q4 — on a machine that is already swapping, the Q4 build is roughly
+    # half the size and correspondingly lighter.
+    #   ollama pull llama3.2:1b-instruct-q4_K_M
+    "llama3.2:1b-instruct-q4_K_M": ModelConfig(
+        name="llama3.2:1b-instruct-q4_K_M",
+        base_url="http://localhost:11434/v1",
+        api_key="ollama",
+    ),
     "gemma2:2b": ModelConfig(
         name="gemma2:2b",
         base_url="http://localhost:11434/v1",
@@ -77,7 +86,17 @@ MODELS: dict[str, ModelConfig] = {
 
 # ── Active model ──────────────────────────────────────────────────────────────
 # Change this one line to switch all agents globally.
-ACTIVE_MODEL: str = "qwen3:4b"
+# Measured on an 8 GB CPU-only Mac (generation speed, same machine/session):
+#   qwen3:0.6b    70.4 tok/s
+#   llama3.2:1b   63.6 tok/s
+#   qwen3:4b       7.3 tok/s   <- ~10x slower
+#
+# Agentic turns chain many generations (tool call -> result -> next call), so
+# that 10x compounds: the same task that finishes in under a minute on 0.6b
+# ran past 10 minutes on 4b. qwen3:4b is the better writer, but it is not
+# viable as the default for tool-using work on this hardware — switch to it
+# per-agent in the Agent Hub when quality matters more than latency.
+ACTIVE_MODEL: str = "qwen3:0.6b"
 
 
 def get_config(key: Optional[str] = None) -> ModelConfig:
