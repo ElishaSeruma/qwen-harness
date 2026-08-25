@@ -304,12 +304,25 @@ function relativeRunTime(value) {
   return `${Math.floor(seconds / 3600)}h ago`;
 }
 
-async function renderActivityDrawer() {
-  const list = $('#activity-list');
-  if (!list) return;
+// The badge in the topbar must keep counting while the drawer is CLOSED, but
+// rebuilding 40 cards while nobody can see them is pure waste. One fetch,
+// badge always, cards only when open.
+async function refreshActivity() {
   let runs = [];
   try { runs = await listRuns(null, 40); } catch { return; }
   $('#activity-count').textContent = String(runs.filter(run => ACTIVE_RUN_STATES.has(run.status)).length);
+  if ($('#activity-drawer').hidden) return;
+  renderActivityDrawer(runs);
+}
+
+async function renderActivityDrawer(prefetched = null) {
+  const list = $('#activity-list');
+  if (!list) return;
+  let runs = prefetched;
+  if (!runs) {
+    try { runs = await listRuns(null, 40); } catch { return; }
+    $('#activity-count').textContent = String(runs.filter(run => ACTIVE_RUN_STATES.has(run.status)).length);
+  }
   list.replaceChildren();
   if (!runs.length) {
     const empty = document.createElement('p'); empty.className = 'transcript-empty'; empty.textContent = 'No runs yet.'; list.append(empty); return;
@@ -350,8 +363,15 @@ function setActivityDrawer(open) {
 }
 $('#activity-toggle').addEventListener('click', () => setActivityDrawer($('#activity-drawer').hidden));
 $('#activity-close').addEventListener('click', () => setActivityDrawer(false));
-window.addEventListener('qh-run-changed', renderActivityDrawer);
-window.addEventListener('qh-run-event', renderActivityDrawer);
+// Run events stream in fast during inference; without a trailing debounce the
+// drawer rebuilt all 40 cards per event, on top of the interval poll.
+let activityRerenderTimer = null;
+function scheduleActivityRerender() {
+  clearTimeout(activityRerenderTimer);
+  activityRerenderTimer = setTimeout(refreshActivity, 250);
+}
+window.addEventListener('qh-run-changed', scheduleActivityRerender);
+window.addEventListener('qh-run-event', scheduleActivityRerender);
 
 // Persisted agents may reference a model key that no longer exists in
 // config.py (e.g. after swapping the registry for lighter models) — fall
@@ -3228,6 +3248,9 @@ async function pollResourceMonitor() {
       const memFill = $(`#${prefix}rm-mem-fill`), memValue = $(`#${prefix}rm-mem-value`);
       const tasksEl = $(`#${prefix}resource-tasks`);
       if (!cpuFill || !memFill || !tasksEl) continue;
+      // Both the Home and Project monitors exist in the DOM at all times;
+      // only paint the one actually on screen.
+      if (cpuFill.closest('.view')?.hidden) continue;
       const cpuPct = system.cpu_pct ?? 0;
       cpuFill.style.width = `${Math.min(100, cpuPct)}%`;
       cpuFill.className = `resource-bar-fill ${pctFillClass(cpuPct)}`;
@@ -3273,14 +3296,58 @@ await refreshGrants();
 await refreshProjects();
 await loadCodeTree(getDirectory() || '.');
 pollBackend(); pollOllama(); pollResourceMonitor();
-renderActivityDrawer();
-setInterval(pollBackend, 8000);
-setInterval(pollOllama, 5000);
-setInterval(pollResourceMonitor, 3000);
-setInterval(renderActivityDrawer, 3000);
+refreshActivity();
+
+// Polling discipline. Previously five timers fired unconditionally, with no
+// in-flight guard — a slow endpoint stacked duplicate requests until the
+// backend was saturated. Each poller now (a) skips while the tab is hidden,
+// (b) skips while its own previous call is still running, and (c) skips when
+// the DOM it updates isn't visible.
+const inFlightPolls = new Set();
+
+// Fail-safe visibility gate. Some embedded hosts (WKWebView in the Mac app,
+// automation browsers) can report `hidden` permanently — suppressing polls
+// there would freeze the whole UI. So only trust `hidden` once we've actually
+// observed the page report `visible` at least once; until then, always poll.
+let hasEverBeenVisible = document.visibilityState === 'visible';
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') hasEverBeenVisible = true;
+});
+function pollingSuppressed() {
+  return hasEverBeenVisible && document.visibilityState === 'hidden';
+}
+
+function schedulePoll(key, fn, intervalMs, shouldRun = () => true) {
+  setInterval(async () => {
+    if (pollingSuppressed()) return;
+    if (inFlightPolls.has(key)) return;
+    if (!shouldRun()) return;
+    inFlightPolls.add(key);
+    try { await fn(); } catch { /* pollers report their own errors */ }
+    finally { inFlightPolls.delete(key); }
+  }, intervalMs);
+}
+
+schedulePoll('backend', pollBackend, 8000);
+schedulePoll('ollama', pollOllama, 5000);
+// 3s was chosen to look live during inference; when nothing is running the
+// numbers barely move, so back off and leave the CPU to the models.
+schedulePoll('resources', pollResourceMonitor, 5000);
+// The activity drawer rebuilds up to 40 cards from a ~22KB payload — pointless
+// while the drawer is closed.
+schedulePoll('activity', refreshActivity, 5000);
 // Projects are shared, on-disk state (~/.qwen-harness/projects.json) that
 // any client (this browser tab, another tab, the Mac app) can mutate — so
 // while the Projects view is open, poll for changes made elsewhere instead
 // of only refreshing on this client's own actions.
-setInterval(() => { if (!$('#view-projects').hidden) refreshProjects(); }, 4000);
+schedulePoll('projects', refreshProjects, 4000, () => !$('#view-projects').hidden);
+
+// Catch up immediately when the tab comes back, instead of waiting out a
+// full interval on stale data.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  pollBackend(); pollOllama(); pollResourceMonitor();
+  refreshActivity();
+  if (!$('#view-projects').hidden) refreshProjects();
+});
 switchRoute(localStorage.getItem(ROUTE_KEY) || 'home');

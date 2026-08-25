@@ -80,6 +80,18 @@ PERMISSIONS_PATH = STATE_DIR / 'permissions.json'
 PROJECTS_PATH = STATE_DIR / 'projects.json'
 PROJECTS_LOCK = threading.RLock()
 
+
+def _total_memory_mb():
+    """Physical RAM in MB. A machine constant — read once, not per request."""
+    try:
+        out = subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True, timeout=5).stdout.strip()
+        return round(int(out) / (1024 * 1024), 1)
+    except Exception:
+        return None
+
+
+TOTAL_MEMORY_MB = _total_memory_mb()
+
 SKIP_DIR_NAMES = {'.git', 'node_modules', '__pycache__', '.DS_Store'}
 
 # Same substring blocklist as tools/files.py's run_shell, so the browser
@@ -903,19 +915,34 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+        # One `ps` sweep (~0.05s) yields BOTH the per-llama-server rows and the
+        # machine-wide CPU total. This replaces the old `top -l 1` call, which
+        # measured 25.8s on an 8GB Mac under load — polled every 3s, it starved
+        # the very inference it was monitoring.
         procs = []
+        total_cpu = None
         try:
             out = subprocess.run(
                 ['ps', '-axo', 'pid,pcpu,rss,comm'],
                 capture_output=True, text=True, timeout=5,
             ).stdout
+            cpu_sum = 0.0
             for line in out.splitlines()[1:]:
                 parts = line.split(None, 3)
                 if len(parts) < 4:
                     continue
                 pid, pcpu, rss, comm = parts
+                try:
+                    cpu_sum += float(pcpu)
+                except ValueError:
+                    continue
                 if 'llama-server' in comm:
                     procs.append({'pid': int(pid), 'cpu_pct': float(pcpu), 'mem_mb': round(int(rss) / 1024, 1)})
+            # ps %cpu is a per-process lifetime average, not an instantaneous
+            # sample, so this lags real utilization — but it is the same metric
+            # already shown per-task, so the numbers stay internally consistent.
+            cores = os.cpu_count() or 1
+            total_cpu = round(min(100.0, cpu_sum / cores), 1)
         except Exception:
             pass
 
@@ -931,12 +958,23 @@ class Handler(BaseHTTPRequestHandler):
                 'mem_mb': proc['mem_mb'] if proc else None,
             })
 
-        system = {'cpu_pct': None, 'mem_used_mb': None, 'mem_total_mb': None}
+        # Load average is the honest saturation signal (ps %cpu is a lifetime
+        # average and understates bursts), so ship it alongside rather than
+        # instead of cpu_pct — 0.01s, and it's what exposed the pile-up.
+        load_avg = None
         try:
-            total = subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True, timeout=5).stdout.strip()
-            system['mem_total_mb'] = round(int(total) / (1024 * 1024), 1)
+            raw = subprocess.run(['sysctl', '-n', 'vm.loadavg'], capture_output=True, text=True, timeout=2).stdout
+            load_avg = round(float(raw.strip().strip('{}').split()[0]), 2)
         except Exception:
             pass
+
+        system = {
+            'cpu_pct': total_cpu,
+            'mem_used_mb': None,
+            'mem_total_mb': TOTAL_MEMORY_MB,
+            'load_avg': load_avg,
+            'cpu_count': os.cpu_count(),
+        }
         try:
             vm = subprocess.run(['vm_stat'], capture_output=True, text=True, timeout=5).stdout
             page_size_m = re.search(r'page size of (\d+) bytes', vm)
@@ -947,13 +985,6 @@ class Handler(BaseHTTPRequestHandler):
                 if m:
                     used_pages += int(m.group(1))
             system['mem_used_mb'] = round(used_pages * page_size / (1024 * 1024), 1)
-        except Exception:
-            pass
-        try:
-            top = subprocess.run(['top', '-l', '1', '-n', '0'], capture_output=True, text=True, timeout=5).stdout
-            m = re.search(r'CPU usage:\s*([\d.]+)% user,\s*([\d.]+)% sys', top)
-            if m:
-                system['cpu_pct'] = round(float(m.group(1)) + float(m.group(2)), 1)
         except Exception:
             pass
 
