@@ -47,6 +47,9 @@
         <h1 id="route-title">Home</h1>
       </div>
       <div class="topbar-status">
+        <button id="activity-toggle" class="activity-toggle" type="button" aria-expanded="false" title="Open activity">
+          Activity <span id="activity-count">0</span>
+        </button>
         <span class="status-pill" id="backend-status" data-state="checking">
           <span class="status-dot" aria-hidden="true"></span>
           <span id="backend-status-label">Checking server…</span>
@@ -137,6 +140,7 @@
         <div class="filetree-actions" aria-label="File actions">
           <button id="filetree-open-folder" type="button" class="mode-button">Open Folder</button>
           <button id="filetree-refresh" type="button" class="mode-button">Refresh</button>
+          <button id="filetree-secrets" type="button" class="mode-button" aria-pressed="false">Show Secrets</button>
           <button id="filetree-new-file" type="button" class="mode-button">New File</button>
           <button id="filetree-new-folder" type="button" class="mode-button">New Folder</button>
           <button id="filetree-rename" type="button" class="mode-button" disabled>Rename</button>
@@ -298,16 +302,29 @@
           <section class="document-dock" aria-label="Document dock">
             <div class="dock-head">
               <h3>Document dock</h3>
-              <label class="mode-button doc-upload-button">
-                Upload .md
-                <input id="project-doc-upload" type="file" accept=".md,text/markdown,text/plain" multiple hidden />
-              </label>
+              <div class="dock-actions">
+                <button id="project-index" type="button" class="mode-button">Index Repo</button>
+                <label class="mode-button doc-upload-button">
+                  Upload .md
+                  <input id="project-doc-upload" type="file" accept=".md,text/markdown,text/plain" multiple hidden />
+                </label>
+              </div>
             </div>
             <div id="project-doc-list" class="drawer-list project-doc-list"></div>
+            <div class="dock-actions doc-selected-actions">
+              <button id="project-doc-rename" type="button" class="mode-button" disabled>Rename</button>
+              <button id="project-doc-delete" type="button" class="mode-button mode-button-danger" disabled>Delete</button>
+            </div>
           </section>
 
           <section class="project-context" aria-label="Document context">
             <h3 id="project-doc-title">Context</h3>
+            <p id="project-context-status" class="panel-copy">Repository not indexed.</p>
+            <form id="project-context-search" class="composer context-search">
+              <input id="project-context-query" type="search" placeholder="Search files and symbols" autocomplete="off" />
+              <button type="submit">Search</button>
+            </form>
+            <div id="project-context-results" class="context-results"></div>
             <textarea id="project-doc-preview" class="code-editor project-doc-preview" readonly placeholder="Upload or select markdown documents."></textarea>
           </section>
         </div>
@@ -392,6 +409,17 @@
             <button id="project-remove" type="button" class="mode-button mode-button-danger" disabled>Delete Project</button>
           </div>
         </details>
+        <div class="git-inspector" aria-label="Git inspector">
+          <button type="button" class="mode-button" data-project-git-action="diff">Diff</button>
+          <button type="button" class="mode-button" data-project-git-action="stage">Stage All</button>
+          <button type="button" class="mode-button" data-project-git-action="unstage">Unstage</button>
+          <button type="button" class="mode-button" data-project-git-action="worktrees">Worktrees</button>
+          <button id="project-worktree-create" type="button" class="mode-button">New Worktree</button>
+          <button id="project-worktree-remove" type="button" class="mode-button">Remove Worktree</button>
+          <button id="project-pr-create" type="button" class="mode-button">Create PR</button>
+          <button id="project-issue-create" type="button" class="mode-button">Create Issue</button>
+          <button id="project-workflows" type="button" class="mode-button">Actions</button>
+        </div>
         <pre id="project-git-output" class="project-git-output">Git output will appear here.</pre>
         </div>
       </section>
@@ -469,6 +497,26 @@
     </main>
 
   </div>
+</div>
+
+<aside class="activity-drawer" id="activity-drawer" hidden aria-label="Run activity">
+  <div class="activity-drawer-head">
+    <div>
+      <span class="eyebrow">Runs</span>
+      <h2>Activity</h2>
+    </div>
+    <button id="activity-close" class="icon-button" type="button" title="Close activity" aria-label="Close activity">×</button>
+  </div>
+  <div id="activity-list" class="activity-list">
+    <p class="transcript-empty">No runs yet.</p>
+  </div>
+</aside>
+
+<div id="selection-actions" class="selection-actions" hidden role="toolbar" aria-label="Selected text actions">
+  <button type="button" data-selection-action="copy">Copy</button>
+  <button type="button" data-selection-action="quote">Quote</button>
+  <button type="button" data-selection-action="explain">Explain</button>
+  <button type="button" data-selection-action="improve">Improve</button>
 </div>
 
 <!-- ── shared capability drawer (bottom sheet, one instance for the whole app) ── -->

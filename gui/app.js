@@ -6,6 +6,11 @@
 
 import { renderFileTree, withPaths } from './filetree.js';
 import { runAgentTurn } from './agent-loop.js';
+import { createActivityIndicator } from './activity.js';
+import { createMessageActions, renderMarkdown } from './message-renderer.js';
+import { beginRun, cancelRun, emitRunEvent, failRun, finishRun, listRuns, updateRun } from './runs.js';
+import { createTaskPlan, executeTaskGraph } from './orchestration.js';
+import { escalateEffort, getEffort, lockEffort, mountEffortGauge } from './effort.js';
 import {
   ensureChat, persistMessage, touchChat, trackUsageAndMaybeCompact, buildPriorMessages,
   getActiveChatId, setActiveChatId, isSupabaseConnected, invalidateSupabaseStatus,
@@ -14,13 +19,15 @@ import {
 import {
   apiListDir, apiReadFile, apiWriteFile, apiExec, apiHealth, apiSystemStats,
   apiFsGrants, apiFsGrant, apiCreateFile, apiCreateDir, apiMovePath, apiDeletePath,
-  apiProjects, apiProjectCreate, apiProjectAddDocs, apiProjectReadDoc, apiProjectPublishGithub, apiProjectGitAction, apiProjectDelete, apiProjectSettings,
+  apiProjects, apiProjectCreate, apiProjectAddDocs, apiProjectReadDoc, apiProjectDeleteDoc, apiProjectRenameDoc,
+  apiProjectIndex, apiProjectSearch, apiProjectPublishGithub, apiProjectGitAction, apiProjectDelete, apiProjectSettings,
   apiWebSearch, apiWebScrape, apiGithubStatus, apiGithubConnect, apiGithubDisconnect, apiGithubRepos,
   apiSupabaseStatus, apiSupabaseConnect, apiSupabaseDisconnect,
   isDesktopClient, desktopChooseDirectory, desktopChooseFile,
   getDirectory, setDirectory, getHotphrases, setHotphrases,
   getConnectors, setConnectorEnabled, CONNECTOR_DEFS,
   trackComposerFocus, insertIntoLastComposer, getLastComposerValue,
+  isScopeApproved, approveScopeForSession,
   getAttachments, clearAttachments, addAttachmentFiles, attachmentsAsPromptSuffix,
   renderCapabilityBar,
 } from './capabilities.js';
@@ -153,6 +160,20 @@ function showToast(message, { kind = 'error', suggestion = null, timeoutMs = 900
   while (stack.children.length > 4) stack.firstElementChild.remove();
   setTimeout(() => toast.remove(), timeoutMs);
 }
+// Shared approval handler for gated tools (write/edit/shell/computer).
+// Honours the Auto-approve toggle and per-scope session grants so an agent
+// can chain many edits without a modal per step, while still asking once
+// for anything not yet trusted this session.
+async function handleApprovalRequest({ tool, scope, prompt }) {
+  const key = scope || tool;
+  if (isScopeApproved(key)) return true;
+  const choice = window.confirm(
+    `${prompt}\n\nOK = allow this and everything else in "${key}" for this session.\nCancel = deny.`
+  );
+  if (choice) approveScopeForSession(key);
+  return choice;
+}
+
 window.addEventListener('qh-api-error', (e) => {
   lastErrorMessage = e.detail.message;
   showToast(e.detail.message);
@@ -180,7 +201,7 @@ function makeAgent(slug, name, modelKey, nickname = null) {
 function persistAgents() {
   localStorage.setItem(AGENTS_KEY, JSON.stringify({
     agentSeq, activeAgentId,
-    agents: agents.map(a => ({ id: a.id, name: a.name, slug: a.slug, nickname: a.nickname, modelKey: a.modelKey, state: a.state })),
+    agents: agents.map(a => ({ id: a.id, name: a.name, slug: a.slug, nickname: a.nickname, modelKey: a.modelKey, state: 'idle' })),
   }));
 }
 function loadAgents() {
@@ -190,7 +211,7 @@ function loadAgents() {
     const data = JSON.parse(raw);
     if (!Array.isArray(data.agents) || data.agents.length === 0) return null;
     agentSeq = data.agentSeq || data.agents.length;
-    const restored = data.agents.map(a => ({ ...makeAgent(a.slug, a.name, a.modelKey, a.nickname ?? null), id: a.id, state: a.state || 'sleeping' }));
+    const restored = data.agents.map(a => ({ ...makeAgent(a.slug, a.name, a.modelKey, a.nickname ?? null), id: a.id, state: 'idle' }));
     return { agents: restored, activeAgentId: data.activeAgentId };
   } catch { return null; }
 }
@@ -204,6 +225,133 @@ const agents = restored ? restored.agents : [
   makeAgent('grok-bot', 'critic', modelsConfig.active),
 ];
 let activeAgentId = (restored && agents.some(a => a.id === restored.activeAgentId)) ? restored.activeAgentId : agents[0].id;
+
+// ── durable activity drawer ────────────────────────────────────────────
+const ACTIVE_RUN_STATES = new Set(['queued', 'planning', 'running', 'thinking', 'working', 'verifying', 'waiting_permission']);
+let retryParentRun = null;
+const surfaceActiveRuns = new Map();
+const SURFACE_BUTTONS = { home: 'home-send', project: 'project-send', code: null, hub: null };
+
+for (const [surface, input, button] of [
+  ['home', $('#home-composer-input'), $('#home-send')],
+  ['project', $('#project-composer-input'), $('#project-send')],
+  ['project-agent', $('#project-agent-input'), $('#project-agent-send')],
+  ['code', $('#code-composer-input'), $('#code-composer button[type="submit"]')],
+  ['hub', $('#composer-input'), $('#composer button[type="submit"]')],
+]) mountEffortGauge(surface, input, button);
+
+function surfaceButton(surface) {
+  if (SURFACE_BUTTONS[surface]) return $(`#${SURFACE_BUTTONS[surface]}`);
+  if (surface === 'code') return $('#code-composer button[type="submit"]');
+  if (surface === 'hub') return $('#composer button[type="submit"]');
+  return null;
+}
+
+function markSurfaceRun(surface, run) {
+  surfaceActiveRuns.set(surface, run.id);
+  lockEffort(surface, true);
+  const button = surfaceButton(surface);
+  if (button) { button.textContent = 'Stop'; button.classList.add('is-stop'); }
+}
+
+function clearSurfaceRun(surface, runId) {
+  if (surfaceActiveRuns.get(surface) !== runId) return;
+  surfaceActiveRuns.delete(surface);
+  lockEffort(surface, false);
+  const button = surfaceButton(surface);
+  if (button) {
+    button.textContent = surface === 'home' ? 'Send →' : 'Send';
+    button.classList.remove('is-stop');
+  }
+}
+
+function effortForPrompt(surface, text) {
+  const effort = getEffort(surface, text);
+  return { effort, payload: { effort_level: effort.level, effort_source: effort.source } };
+}
+
+function effortRunOptions(surface, run) {
+  return {
+    effort: run.effort_level || 1,
+    onEffortEscalation: async ({ level = 4, reason = 'Model requested additional reasoning' } = {}) => {
+      escalateEffort(surface, level);
+      await updateRun(run.id, { effort_level: level, effort_source: 'model', effort_reason: reason });
+      await emitRunEvent(run.id, 'run.effort_escalated', { from: run.effort_level, to: level, reason });
+      run.effort_level = level; run.effort_source = 'model';
+    },
+  };
+}
+
+async function stopSurfaceRun(surface) {
+  const runId = surfaceActiveRuns.get(surface);
+  if (!runId) return false;
+  await cancelRun(runId);
+  clearSurfaceRun(surface, runId);
+  return true;
+}
+
+function consumeRunLineage() {
+  if (!retryParentRun) return {};
+  const lineage = { parent_run_id: retryParentRun.id, attempt: Number(retryParentRun.attempt || 1) + 1 };
+  retryParentRun = null;
+  return lineage;
+}
+
+function relativeRunTime(value) {
+  const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  return `${Math.floor(seconds / 3600)}h ago`;
+}
+
+async function renderActivityDrawer() {
+  const list = $('#activity-list');
+  if (!list) return;
+  let runs = [];
+  try { runs = await listRuns(null, 40); } catch { return; }
+  $('#activity-count').textContent = String(runs.filter(run => ACTIVE_RUN_STATES.has(run.status)).length);
+  list.replaceChildren();
+  if (!runs.length) {
+    const empty = document.createElement('p'); empty.className = 'transcript-empty'; empty.textContent = 'No runs yet.'; list.append(empty); return;
+  }
+  for (const run of runs) {
+    const card = document.createElement('article'); card.className = 'run-card'; card.dataset.runId = run.id;
+    const head = document.createElement('div'); head.className = 'run-card-head';
+    head.append(createActivityIndicator(run.status, { size: 20, detail: run.events?.at(-1)?.type || run.surface }));
+    const effortNames = ['Quick', 'Focus', 'Deep', 'Max'];
+    const meta = document.createElement('span'); meta.className = 'run-card-meta'; meta.textContent = `${effortNames[(run.effort_level || 1) - 1]} ${run.effort_level || 1}/4 · #${run.attempt || 1} · ${relativeRunTime(run.updated_at)}`; head.append(meta);
+    const instruction = document.createElement('p'); instruction.className = 'run-card-instruction'; instruction.textContent = run.instruction || '(no instruction)';
+    const taskList = document.createElement('div'); taskList.className = 'run-task-list';
+    for (const task of run.tasks || []) {
+      const row = document.createElement('div'); row.className = 'run-task-row';
+      row.append(createActivityIndicator(task.status || 'queued', { size: 14, label: false }));
+      const copy = document.createElement('span'); copy.textContent = task.title;
+      const owner = document.createElement('small'); owner.textContent = task.agent_id || task.role || '';
+      row.append(copy, owner); taskList.append(row);
+    }
+    const footer = document.createElement('div'); footer.className = 'run-card-actions';
+    if (ACTIVE_RUN_STATES.has(run.status)) {
+      const stop = document.createElement('button'); stop.type = 'button'; stop.textContent = 'Stop';
+      stop.addEventListener('click', async () => { await cancelRun(run.id); renderActivityDrawer(); });
+      footer.append(stop);
+    } else {
+      const retry = document.createElement('button'); retry.type = 'button'; retry.textContent = 'Retry';
+      retry.addEventListener('click', () => window.dispatchEvent(new CustomEvent('qh-retry-run', { detail: run })));
+      footer.append(retry);
+    }
+    card.append(head, instruction); if (taskList.childElementCount) card.append(taskList); card.append(footer); list.append(card);
+  }
+}
+
+function setActivityDrawer(open) {
+  $('#activity-drawer').hidden = !open;
+  $('#activity-toggle').setAttribute('aria-expanded', String(open));
+  if (open) renderActivityDrawer();
+}
+$('#activity-toggle').addEventListener('click', () => setActivityDrawer($('#activity-drawer').hidden));
+$('#activity-close').addEventListener('click', () => setActivityDrawer(false));
+window.addEventListener('qh-run-changed', renderActivityDrawer);
+window.addEventListener('qh-run-event', renderActivityDrawer);
 
 // Persisted agents may reference a model key that no longer exists in
 // config.py (e.g. after swapping the registry for lighter models) — fall
@@ -240,7 +388,7 @@ function agentBadge(agent, fallbackLabel = 'agent') {
   name.textContent = agent?.name || fallbackLabel;
   const state = document.createElement('span');
   state.className = 'chat-agent-state';
-  state.textContent = agent ? `${agent.state || 'idle'} · ${displayName(agent)}` : 'idle';
+  state.append(createActivityIndicator(agent?.state || 'idle', { size: 15, label: displayName(agent || { slug: fallbackLabel }) }));
   meta.append(name, state);
   wrap.append(avatar, meta);
   if (agent) mountInto(avatar, agent.slug, STATE_SEQUENCE[agent.state] || 'idle').catch(() => {});
@@ -251,11 +399,20 @@ function activeAgent() {
   return agents.find(agent => agent.id === activeAgentId) || agents[0];
 }
 
-function renderChatEntry(agent, entry, fallbackLabel = 'agent') {
+function stampEntry(entry) {
+  if (!entry.created_at) entry.created_at = new Date().toISOString();
+  return entry;
+}
+
+function renderChatEntry(agent, entry, fallbackLabel = 'agent', surface = currentSurface()) {
+  stampEntry(entry);
   const wrap = document.createElement('div');
   wrap.className = 'chat-entry-wrap';
+  wrap.dataset.surface = surface;
   if (entry.type === 'user' || entry.type === 'assistant') wrap.append(agentBadge(agent, fallbackLabel));
-  wrap.append(renderEntry(entry));
+  const message = renderEntry(entry);
+  if (entry.type === 'user' || entry.type === 'assistant') message.append(createMessageActions(entry));
+  wrap.append(message);
   return wrap;
 }
 
@@ -272,9 +429,9 @@ function setAgentState(agent, state) {
     $('#state-picker').value = state;
   }
   const hubBadge = document.querySelector(`.hub-card[data-agent-id="${agent.id}"] .roster-state`);
-  if (hubBadge) hubBadge.textContent = agent.state;
+  if (hubBadge) hubBadge.replaceChildren(createActivityIndicator(agent.state, { size: 15, label: agent.state }));
   document.querySelectorAll(`.chat-agent-badge[data-agent-id="${agent.id}"] .chat-agent-state`).forEach(el => {
-    el.textContent = `${agent.state || 'idle'} · ${displayName(agent)}`;
+    el.replaceChildren(createActivityIndicator(agent.state || 'idle', { size: 15, label: displayName(agent) }));
   });
   persistAgents();
 }
@@ -290,7 +447,9 @@ function renderEntry(entry) {
   if (entry.type === 'tool_call') {
     const div = document.createElement('div');
     div.className = 'msg msg-tool';
-    div.innerHTML = `<span class="tool-head">🔧 ${entry.name}</span>(${JSON.stringify(entry.args)})`;
+    const head = document.createElement('span'); head.className = 'tool-head'; head.textContent = `Tool: ${entry.name || 'unknown'}`;
+    const args = document.createElement('span'); args.textContent = ` (${JSON.stringify(entry.args || {})})`;
+    div.append(head, args);
     return div;
   }
   if (entry.type === 'tool_result') {
@@ -301,18 +460,166 @@ function renderEntry(entry) {
   }
   const div = document.createElement('div');
   div.className = `msg msg-${entry.type === 'user' ? 'user' : 'assistant'}`;
-  if (entry.role) div.innerHTML = `<span class="msg-role">${entry.role}</span>${entry.text}`;
-  else div.textContent = entry.text;
+  if (entry.role) { const role = document.createElement('span'); role.className = 'msg-role'; role.textContent = entry.role; div.append(role); }
+  div.append(renderMarkdown(entry.text));
   return div;
 }
+
+function updateStreamingMessage(container, agent, key, text, fallbackLabel = 'agent') {
+  let wrap = container.querySelector(`.chat-entry-wrap[data-stream-key="${CSS.escape(key)}"]`);
+  if (!wrap) {
+    container.querySelector('.transcript-empty')?.remove();
+    wrap = document.createElement('div'); wrap.className = 'chat-entry-wrap is-streaming'; wrap.dataset.streamKey = key;
+    wrap.append(agentBadge(agent, fallbackLabel));
+    const message = document.createElement('div'); message.className = 'msg msg-assistant'; wrap.append(message);
+    container.append(wrap);
+  }
+  wrap.querySelector('.msg').replaceChildren(renderMarkdown(text || ' '));
+  container.scrollTop = container.scrollHeight;
+}
+
+function clearStreamingMessage(container, key) {
+  container.querySelector(`.chat-entry-wrap[data-stream-key="${CSS.escape(key)}"]`)?.remove();
+}
 function appendEntry(agent, entry) {
+  stampEntry(entry);
   agent.transcript.push(entry);
   if (agent.id === activeAgentId) {
     $('#transcript').querySelector('.transcript-empty')?.remove();
-    $('#transcript').append(renderChatEntry(agent, entry, agent.name));
+    $('#transcript').append(renderChatEntry(agent, entry, agent.name, 'hub'));
     $('#transcript').scrollTop = $('#transcript').scrollHeight;
   }
 }
+
+function currentSurface() {
+  if (!$('#view-projects').hidden) return 'project';
+  if (!$('#view-code').hidden) return 'code';
+  if (!$('#view-hub').hidden) return 'hub';
+  return 'home';
+}
+
+function composerForSurface(surface = currentSurface()) {
+  return {
+    home: $('#home-composer-input'), project: $('#project-composer-input'),
+    code: $('#code-composer-input'), hub: $('#composer-input'),
+  }[surface];
+}
+
+async function submitSurface(surface = currentSurface()) {
+  if (surface === 'project') return sendProjectMessage();
+  if (surface === 'code') return $('#code-composer').requestSubmit();
+  if (surface === 'hub') { setHubMode('live'); return $('#composer').requestSubmit(); }
+  return sendHomeMessage();
+}
+
+function removeEditedEntry(surface, entry) {
+  if (surface === 'code') {
+    const index = codeChatHistory.indexOf(entry);
+    if (index >= 0) codeChatHistory.splice(index, 1);
+    saveCodeChat();
+  } else if (surface === 'project') {
+    const project = activeProject();
+    if (project) {
+      projectMainFeed[project.id] = (projectMainFeed[project.id] || []).filter(row => row.entry !== entry);
+      projectAgentFeed[project.id] = (projectAgentFeed[project.id] || []).filter(row => row.entry !== entry);
+      persistProjectMainFeed();
+      persistProjectAgentFeed();
+    }
+  }
+  for (const agent of agents) agent.transcript = agent.transcript.filter(item => item !== entry);
+  persistAgents();
+}
+
+async function openInlinePromptEditor(entry, source) {
+  const wrap = source?.closest('.chat-entry-wrap');
+  const message = source?.closest('.msg');
+  if (!wrap || !message || wrap.classList.contains('is-editing')) return;
+  const surface = wrap.dataset.surface || currentSurface();
+  await stopSurfaceRun(surface);
+  wrap.classList.add('is-editing');
+
+  const editor = document.createElement('div');
+  editor.className = 'message-inline-editor';
+  const textarea = document.createElement('textarea');
+  textarea.value = String(entry.text || '');
+  textarea.setAttribute('aria-label', 'Edit prompt');
+  const controls = document.createElement('div');
+  controls.className = 'message-inline-editor-actions';
+  const cancel = document.createElement('button');
+  cancel.type = 'button'; cancel.textContent = '×'; cancel.title = 'Cancel edit'; cancel.setAttribute('aria-label', 'Cancel edit');
+  const send = document.createElement('button');
+  send.type = 'button'; send.textContent = '↑'; send.title = 'Send edited prompt'; send.setAttribute('aria-label', 'Send edited prompt');
+  controls.append(cancel, send); editor.append(textarea, controls);
+
+  const restore = () => {
+    wrap.classList.remove('is-editing');
+    message.replaceChildren(renderMarkdown(entry.text), createMessageActions(entry));
+  };
+  cancel.addEventListener('click', restore);
+  const submitEdit = async () => {
+    const text = textarea.value.trim();
+    if (!text) return;
+    entry.text = text;
+    removeEditedEntry(surface, entry);
+    wrap.remove();
+    const input = composerForSurface(surface);
+    if (!input) return;
+    input.value = text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await submitSurface(surface);
+  };
+  send.addEventListener('click', submitEdit);
+  textarea.addEventListener('keydown', event => {
+    if (event.key === 'Escape') restore();
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') submitEdit();
+  });
+  message.replaceChildren(editor);
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+}
+
+window.addEventListener('qh-message-action', async ({ detail: { action, entry, source } }) => {
+  const text = String(entry?.text || '');
+  if (action === 'copy') return navigator.clipboard.writeText(text);
+  if (action === 'edit') return openInlinePromptEditor(entry, source);
+  const input = composerForSurface();
+  if (!input) return;
+  if (action === 'quote') input.value = `${input.value}${input.value ? '\n\n' : ''}> ${text.replace(/\n/g, '\n> ')}`;
+  if (action === 'retry') input.value = text;
+  input.focus();
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  if (action === 'retry') await submitSurface();
+});
+
+let selectedMessageText = '';
+document.addEventListener('mouseup', event => {
+  if (event.target.closest('#selection-actions')) return;
+  const selection = window.getSelection();
+  const text = selection?.toString().trim() || '';
+  const insideMessage = selection?.anchorNode?.parentElement?.closest?.('.msg');
+  const toolbar = $('#selection-actions');
+  if (!text || !insideMessage) { toolbar.hidden = true; selectedMessageText = ''; return; }
+  selectedMessageText = text.slice(0, 8000);
+  const rect = selection.getRangeAt(0).getBoundingClientRect();
+  toolbar.style.left = `${Math.max(8, Math.min(window.innerWidth - 280, rect.left))}px`;
+  toolbar.style.top = `${Math.max(8, rect.top - 42)}px`;
+  toolbar.hidden = false;
+});
+
+$('#selection-actions').addEventListener('click', async event => {
+  const action = event.target.closest('button')?.dataset.selectionAction;
+  if (!action || !selectedMessageText) return;
+  if (action === 'copy') await navigator.clipboard.writeText(selectedMessageText);
+  else {
+    const prefix = action === 'quote' ? '> ' : action === 'explain' ? 'Explain this selection:\n\n' : 'Improve this selection:\n\n';
+    const body = action === 'quote' ? selectedMessageText.replace(/\n/g, '\n> ') : selectedMessageText;
+    const input = composerForSurface();
+    input.value = `${input.value}${input.value ? '\n\n' : ''}${prefix}${body}`;
+    input.focus(); input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  $('#selection-actions').hidden = true;
+  window.getSelection()?.removeAllRanges();
+});
 
 // ═══════════════════════════════════════════════════════════════════════
 // HOME — chat-first instruction dispatch
@@ -336,7 +643,7 @@ function renderAttachmentChips() {
   for (const [i, att] of getAttachments().entries()) {
     const chip = document.createElement('span');
     chip.className = 'attachment-chip';
-    chip.innerHTML = `📎 ${att.name}`;
+    chip.append(document.createTextNode(`📎 ${att.name}`));
     const rm = document.createElement('button');
     rm.type = 'button'; rm.textContent = '×';
     rm.addEventListener('click', () => { getAttachments().splice(i, 1); renderAttachmentChips(); });
@@ -348,6 +655,9 @@ function renderAttachmentChips() {
 function populateHomeSelectors() {
   const targetSel = $('#home-agent-target');
   targetSel.replaceChildren();
+  const autoOpt = document.createElement('option');
+  autoOpt.value = '__auto__'; autoOpt.textContent = 'Auto plan & assign';
+  targetSel.append(autoOpt);
   const broadcastOpt = document.createElement('option');
   broadcastOpt.value = '__all__'; broadcastOpt.textContent = 'Broadcast to all';
   targetSel.append(broadcastOpt);
@@ -403,19 +713,101 @@ async function renderHomeGreetingAvatars() {
 $('#home-agent-target').addEventListener('change', renderHomeGreetingAvatars);
 
 function homeFeedAppend(agentLabel, entry) {
+  stampEntry(entry);
   const feed = $('#home-feed');
   feed.querySelector('.transcript-empty')?.remove();
-  const wrap = document.createElement('div');
-  wrap.className = 'chat-entry-wrap';
   const agent = agents.find(a => a.name === agentLabel || a.id === agentLabel);
-  const el = renderEntry(entry);
-  if (entry.type === 'user' || entry.type === 'assistant') wrap.append(agentBadge(agent, agentLabel));
-  wrap.append(el);
-  feed.append(wrap);
+  feed.append(renderChatEntry(agent, entry, agentLabel, 'home'));
   feed.scrollTop = feed.scrollHeight;
 }
 
+function feedForSurface(surface) {
+  return surface === 'project' ? $('#project-main-feed')
+    : surface === 'code' ? $('#code-transcript')
+      : surface === 'hub' ? $('#transcript') : $('#home-feed');
+}
+
+function appendSurfaceEntry(surface, project, agent, entry) {
+  if (surface === 'project') appendProjectMainFeed(project, agent?.name || 'orchestrator', entry);
+  else if (surface === 'code') appendCodeEntry(entry);
+  else if (surface === 'hub') appendEntry(agent || activeAgent(), entry);
+  else homeFeedAppend(agent?.name || 'orchestrator', entry);
+  if (agent && !['code', 'hub'].includes(surface)) appendEntry(agent, entry);
+}
+
+async function runAutoOrchestration({ surface, instruction, project = null, modelKey, pool }) {
+  if (await stopSurfaceRun(surface)) return;
+  const { payload: effortPayload } = effortForPrompt(surface, instruction);
+  const cwd = project?.path || currentTreeRoot || getDirectory() || '.';
+  const context = project ? await projectDocsContext(project) : '';
+  const { run, controller } = await beginRun({
+    surface, instruction, project_id: project?.id || null, cwd, model_key: modelKey,
+    agent_ids: pool.map(agent => agent.id), ...effortPayload, ...consumeRunLineage(),
+  });
+  markSurfaceRun(surface, run);
+  const coordinator = pool[0] || activeAgent();
+  try {
+    await updateRun(run.id, { status: 'planning' });
+    setAgentState(coordinator, 'thinking');
+    const tasks = await createTaskPlan({ instruction, agents: pool, modelKey, context, signal: controller.signal, runId: run.id, ...effortRunOptions(surface, run) });
+    await updateRun(run.id, { status: 'running', tasks });
+    appendSurfaceEntry(surface, project, coordinator, { type: 'system', text: `Plan created: ${tasks.length} tasks across ${pool.length} agents.` });
+    const completed = await executeTaskGraph({
+      tasks, agents: pool, signal: controller.signal,
+      onChange: async (rows, task) => {
+        const safeRows = rows.map(row => ({ ...row, output: row.output?.slice(0, 5000) || null }));
+        await updateRun(run.id, { tasks: safeRows });
+        await emitRunEvent(run.id, `task.${task.status}`, { task_id: task.id, title: task.title, agent_id: task.agent_id, error: task.error });
+      },
+      worker: async (task, agent, dependencyContext) => {
+        setAgentState(agent, 'thinking');
+        appendSurfaceEntry(surface, project, agent, { type: 'system', text: `${task.title} · assigned to ${agent.name}` });
+        const streamKey = `${run.id}:${task.id}`;
+        const reply = await runAgentTurn({
+          modelKey: agent.modelKey || modelKey, signal: controller.signal, runId: run.id, cwd, toolProfile: 'project',
+          ...effortRunOptions(surface, run),
+          userText: `${task.instruction}\n\nDependency handoff:\n${dependencyContext || '(none)'}`,
+          systemPrompt: `You are the ${task.role} agent in a coordinated task graph. Complete only your assigned task. Use project tools when needed. Return a concise handoff containing work performed, files changed, evidence, and remaining risks.\n${context}`,
+          onToken: content => updateStreamingMessage(feedForSurface(surface), agent, streamKey, content, agent.name),
+          onEvent: event => {
+            if (event.type === 'tool_call') { setAgentState(agent, 'working'); emitRunEvent(run.id, 'agent.tool.started', { task_id: task.id, agent_id: agent.id, tool: event.name, args: event.args }); }
+            if (event.type === 'tool_result') emitRunEvent(run.id, 'agent.tool.completed', { task_id: task.id, agent_id: agent.id });
+          },
+        });
+        clearStreamingMessage(feedForSurface(surface), streamKey);
+        appendSurfaceEntry(surface, project, agent, { type: 'assistant', text: reply });
+        setAgentState(agent, 'idle');
+        return reply;
+      },
+    });
+
+    await updateRun(run.id, { status: 'verifying', tasks: completed });
+    setAgentState(coordinator, 'thinking');
+    const handoffs = completed.map(task => `${task.status.toUpperCase()} ${task.title} (${task.agent_id}):\n${task.output || task.error || ''}`).join('\n\n');
+    const finalKey = `${run.id}:synthesis`;
+    const synthesis = await runAgentTurn({
+      modelKey, signal: controller.signal, runId: run.id, cwd, toolsEnabled: false,
+      ...effortRunOptions(surface, run),
+      systemPrompt: 'You are the lead verifier. Synthesize the task handoffs into one direct final response. State what was completed, verification evidence, failures, and remaining risks. Do not claim work that the handoffs do not prove.',
+      userText: `Original instruction:\n${instruction}\n\nTask handoffs:\n${handoffs.slice(0, 26000)}`,
+      onToken: content => updateStreamingMessage(feedForSurface(surface), coordinator, finalKey, content, coordinator.name),
+    });
+    clearStreamingMessage(feedForSurface(surface), finalKey);
+    appendSurfaceEntry(surface, project, coordinator, { type: 'assistant', text: synthesis });
+    await finishRun(run.id, { synthesis, tasks: completed });
+  } catch (error) {
+    if (error.name !== 'AbortError') {
+      appendSurfaceEntry(surface, project, coordinator, { type: 'system', text: `Orchestration failed: ${error.message}` });
+      await failRun(run.id, error);
+    }
+  } finally {
+    pool.forEach(agent => setAgentState(agent, 'idle'));
+    clearSurfaceRun(surface, run.id);
+  }
+}
+
 async function sendHomeMessage() {
+  if (await stopSurfaceRun('home')) return;
   const input = $('#home-composer-input');
   const text = input.value.trim();
   if (!text && getAttachments().length === 0) return;
@@ -426,27 +818,45 @@ async function sendHomeMessage() {
   const project = activeProject();
   const docsContext = project ? await projectDocsContext(project) : '';
   const projectContext = project ? ` Active project: ${project.name} at ${project.path}.` : '';
+  if (targetId === '__auto__') {
+    input.value = ''; clearAttachments(); renderAttachmentChips();
+    return runAutoOrchestration({ surface: 'home', instruction: fullText, project, modelKey, pool: agents });
+  }
+  const cwd = project?.path || getDirectory() || '.';
+  const { payload: effortPayload } = effortForPrompt('home', fullText);
+  const { run, controller } = await beginRun({
+    surface: 'home', instruction: fullText, project_id: project?.id || null,
+    cwd, model_key: modelKey, agent_ids: targets.map(agent => agent.id), ...effortPayload, ...consumeRunLineage(),
+  });
+  markSurfaceRun('home', run);
   input.value = '';
   clearAttachments();
   renderAttachmentChips();
 
   for (const agent of targets) {
-    homeFeedAppend(agent.name, { type: 'user', text: fullText });
-    appendEntry(agent, { type: 'user', text: fullText });
+    const entry = stampEntry({ type: 'user', text: fullText });
+    homeFeedAppend(agent.name, entry);
+    appendEntry(agent, entry);
     setAgentState(agent, 'listening');
   }
   await sleep(200);
-  for (const agent of targets) setAgentState(agent, 'thinking');
+  for (const agent of targets) {
+    setAgentState(agent, 'thinking');
+    emitRunEvent(run.id, 'agent.thinking', { agent_id: agent.id, agent_name: agent.name });
+  }
 
-  await Promise.all(targets.map(async (agent) => {
+  const outcomes = await Promise.all(targets.map(async (agent) => {
     const chatId = await ensureChat(agent);
     const priorMessages = await buildPriorMessages(chatId);
     try {
       const reply = await runAgentTurn({
         modelKey, userText: fullText, priorMessages,
-        cwd: activeProject()?.path || getDirectory() || null,
+        cwd, signal: controller.signal, runId: run.id, toolProfile: 'home',
+        ...effortRunOptions('home', run),
         systemPrompt: `You are a helpful assistant in the qwen-harness Control Room.${projectContext} Use tools when they would genuinely help.\n${docsContext}`,
-        onEvent: (ev) => {
+        onToken: (content) => updateStreamingMessage($('#home-feed'), agent, `${run.id}:${agent.id}`, content, agent.name),
+        onApprovalRequest: handleApprovalRequest,
+      onEvent: (ev) => {
           if (ev.type === 'usage') {
             trackUsageAndMaybeCompact(chatId, modelKey, ev.totalTokens, (prompt) =>
               runAgentTurn({ modelKey, userText: prompt, systemPrompt: 'You summarize conversations concisely.' })
@@ -455,9 +865,12 @@ async function sendHomeMessage() {
           }
           if (ev.type === 'tool_call') {
             setAgentState(agent, 'working');
+            emitRunEvent(run.id, 'agent.tool.started', { agent_id: agent.id, tool: ev.name, args: ev.args });
             if (['write_file', 'edit_file', 'append_file'].includes(ev.name) && ev.args?.path) logWorkDone(agent.id, 'edit', ev.args.path, chatId);
             else if (ev.name === 'read_file' && ev.args?.path) logWorkDone(agent.id, 'read', ev.args.path, chatId);
           }
+          if (ev.type === 'tool_result') emitRunEvent(run.id, 'agent.tool.completed', { agent_id: agent.id });
+          if (ev.type === 'approval_required') emitRunEvent(run.id, 'agent.waiting_permission', { agent_id: agent.id, tool: ev.tool, scope: ev.scope });
           homeFeedAppend(agent.name, ev);
           appendEntry(agent, ev);
         },
@@ -466,18 +879,34 @@ async function sendHomeMessage() {
       persistMessage(chatId, 'assistant', reply);
       touchChat(chatId, fullText.slice(0, 80));
       const entry = { type: 'assistant', text: reply || '(empty response)' };
+      clearStreamingMessage($('#home-feed'), `${run.id}:${agent.id}`);
       homeFeedAppend(agent.name, entry);
       appendEntry(agent, entry);
       setAgentState(agent, 'happy');
+      emitRunEvent(run.id, 'agent.completed', { agent_id: agent.id });
+      return { agent: agent.name, reply };
     } catch (err) {
+      clearStreamingMessage($('#home-feed'), `${run.id}:${agent.id}`);
+      if (err.name === 'AbortError') {
+        setAgentState(agent, 'idle');
+        return { agent: agent.name, cancelled: true };
+      }
       const entry = { type: 'system', text: `⚠ ${err.message}. Is "ollama serve" running with ${modelKey} pulled?` };
       homeFeedAppend(agent.name, entry);
       appendEntry(agent, entry);
       setAgentState(agent, 'confused');
+      emitRunEvent(run.id, 'agent.failed', { agent_id: agent.id, error: err.message });
+      return { agent: agent.name, error: err.message };
     }
-    await sleep(1200);
+    await sleep(350);
     setAgentState(agent, 'idle');
   }));
+  for (const agent of targets) setAgentState(agent, 'idle');
+  if (controller.signal.aborted) { clearSurfaceRun('home', run.id); return; }
+  const failures = outcomes.filter(result => result?.error);
+  if (failures.length === outcomes.length) await failRun(run.id, failures.map(item => item.error).join('; '));
+  else await finishRun(run.id, outcomes);
+  clearSurfaceRun('home', run.id);
 }
 
 $('#home-send').addEventListener('click', sendHomeMessage);
@@ -644,7 +1073,12 @@ async function renderSupabaseDrawer() {
   if (status.connected) {
     const card = document.createElement('div');
     card.className = 'connector-row';
-    card.innerHTML = `<div class="connector-label"><span>🗄</span><span>${status.url}</span></div>`;
+    const label = document.createElement('div');
+    label.className = 'connector-label';
+    const icon = document.createElement('span'); icon.textContent = '🗄';
+    const url = document.createElement('span'); url.textContent = status.url;
+    label.append(icon, url);
+    card.append(label);
     const disconnectBtn = document.createElement('button');
     disconnectBtn.type = 'button'; disconnectBtn.className = 'mode-button mode-button-danger';
     disconnectBtn.textContent = 'Disconnect';
@@ -658,7 +1092,7 @@ async function renderSupabaseDrawer() {
     const note = document.createElement('p');
     note.className = 'panel-copy';
     note.style.marginTop = '10px';
-    note.textContent = 'Persisted chats, memory search, and work-done logging are active. Run the SQL in supabase/schema.sql once (via the Supabase SQL editor) if you haven\'t yet — this app never runs migrations itself.';
+    note.textContent = 'Persisted chats, memory search, project runs, and work logging are active. Production schema migrations are versioned in supabase/migrations.';
     drawerBody.append(note);
   } else {
     const p2 = document.createElement('p');
@@ -724,7 +1158,9 @@ async function renderChatsDrawer() {
     row.type = 'button';
     row.className = 'drawer-list-row';
     const when = new Date(chat.updated_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-    row.innerHTML = `<strong>${chat.title || '(untitled)'}</strong>&nbsp;&mdash; ${chat.agent_name || chat.agent_id} · ${chat.model_key} · ${when}`;
+    const title = document.createElement('strong');
+    title.textContent = chat.title || '(untitled)';
+    row.append(title, document.createTextNode(` — ${chat.agent_name || chat.agent_id} · ${chat.model_key} · ${when}`));
     row.addEventListener('click', () => loadChatIntoHome(chat));
     list.append(row);
   }
@@ -805,7 +1241,9 @@ function renderHotphrasesDrawer() {
     row.className = 'hotphrase-row';
     const chip = document.createElement('button');
     chip.type = 'button'; chip.className = 'hotphrase-chip';
-    chip.innerHTML = `<strong>${hp.label}</strong> — ${hp.phrase}`;
+    const label = document.createElement('strong');
+    label.textContent = hp.label;
+    chip.append(label, document.createTextNode(` — ${hp.phrase}`));
     chip.addEventListener('click', () => { insertIntoLastComposer(hp.phrase); closeDrawer(); });
     const rm = document.createElement('button');
     rm.type = 'button'; rm.className = 'hotphrase-remove'; rm.textContent = '×';
@@ -929,11 +1367,16 @@ async function renderGithubDrawer() {
   if (status.connected) {
     const card = document.createElement('div');
     card.className = 'connector-row';
-    card.innerHTML = `
-      <div class="connector-label">
-        <img src="${status.avatar_url || ''}" alt="" width="28" height="28" style="border:2px solid var(--border);" />
-        <span>${status.name ? `${status.name} (@${status.login})` : `@${status.login}`}</span>
-      </div>`;
+    const identity = document.createElement('div');
+    identity.className = 'connector-label';
+    const avatar = document.createElement('img');
+    avatar.src = status.avatar_url || '';
+    avatar.alt = ''; avatar.width = 28; avatar.height = 28;
+    avatar.style.border = '2px solid var(--border)';
+    const account = document.createElement('span');
+    account.textContent = status.name ? `${status.name} (@${status.login})` : `@${status.login}`;
+    identity.append(avatar, account);
+    card.append(identity);
     const disconnectBtn = document.createElement('button');
     disconnectBtn.type = 'button'; disconnectBtn.className = 'mode-button mode-button-danger';
     disconnectBtn.textContent = 'Disconnect';
@@ -961,7 +1404,9 @@ async function renderGithubDrawer() {
         const row = document.createElement('a');
         row.className = 'drawer-list-row';
         row.href = r.html_url; row.target = '_blank'; row.rel = 'noopener';
-        row.innerHTML = `<span>${r.private ? '🔒' : '📂'}</span><span>${r.full_name}</span>`;
+        const visibility = document.createElement('span'); visibility.textContent = r.private ? '🔒' : '📂';
+        const name = document.createElement('span'); name.textContent = r.full_name;
+        row.append(visibility, name);
         list.append(row);
       }
     } catch (err) {
@@ -1020,9 +1465,11 @@ async function renderWebsearchDrawer() {
         const row = document.createElement('div');
         row.style.padding = '8px 10px';
         row.style.borderBottom = '2px solid var(--border)';
-        row.innerHTML = `<a href="${hit.url}" target="_blank" rel="noopener" style="font-weight:700;">${hit.title}</a>
-          <div class="connector-note">${hit.url}</div>
-          <div class="panel-copy">${hit.snippet}</div>`;
+        const link = document.createElement('a');
+        link.href = hit.url; link.target = '_blank'; link.rel = 'noopener'; link.style.fontWeight = '700'; link.textContent = hit.title;
+        const url = document.createElement('div'); url.className = 'connector-note'; url.textContent = hit.url;
+        const snippet = document.createElement('div'); snippet.className = 'panel-copy'; snippet.textContent = hit.snippet;
+        row.append(link, url, snippet);
         const scrapeBtn = document.createElement('button');
         scrapeBtn.type = 'button'; scrapeBtn.className = 'hotphrase-remove'; scrapeBtn.style.width = 'auto'; scrapeBtn.style.padding = '4px 8px';
         scrapeBtn.textContent = 'Insert summary →';
@@ -1080,6 +1527,7 @@ let selectedFilePath = null;
 let selectedNode = null;
 let currentTreeRoot = '.';
 let grantedRoots = [];
+let showSecretFiles = false;
 
 function pathJoin(base, name) {
   const trimmed = String(name || '').trim().replace(/^\/+/, '');
@@ -1123,7 +1571,9 @@ async function refreshGrants() {
     for (const root of grantedRoots.slice(0, 4)) {
       const row = document.createElement('div');
       row.className = 'permission-strip-row';
-      row.innerHTML = `<span>•</span><span class="permission-strip-path" title="${root}">${root}</span>`;
+      const bullet = document.createElement('span'); bullet.textContent = '•';
+      const path = document.createElement('span'); path.className = 'permission-strip-path'; path.title = root; path.textContent = root;
+      row.append(bullet, path);
       strip.append(row);
     }
     if (grantedRoots.length > 4) {
@@ -1152,31 +1602,35 @@ async function grantAndOpenFolder() {
     await loadCodeTree(path);
   } catch (err) {
     if (err.cancelled) return;
-    filetreeEl.innerHTML = `<p class="transcript-empty">⚠ ${err.message}</p>`;
+    const error = document.createElement('p'); error.className = 'transcript-empty'; error.textContent = `⚠ ${err.message}`;
+    filetreeEl.replaceChildren(error);
   }
 }
 
 async function loadCodeTree(path) {
   currentTreeRoot = path;
   try {
-    const { entries } = await apiListDir(path);
+    const { entries } = await apiListDir(path, showSecretFiles);
     const tree = entries.map(e => ({ name: e.name, path: e.path, type: e.type }));
     renderFileTree(filetreeEl, tree, {
       onSelect: selectTreeNode,
       selectedPath: selectedNode?.path || selectedFilePath,
       loadChildren: async (node) => {
-        const { entries } = await apiListDir(node.path);
+        const { entries } = await apiListDir(node.path, showSecretFiles);
         return entries.map(e => ({ name: e.name, path: e.path, type: e.type }));
       },
     });
     $('#filetree-path').value = path;
     setDirectory(path);
   } catch (err) {
-    const action = err.permission_required
-      ? '<br><button class="mode-button" id="grant-failed-path" type="button">Grant folder access</button>'
-      : '<br>Is gui/server.py running? Use <code>./wake-up.sh</code> or <code>python3 gui/server.py</code>.';
-    filetreeEl.innerHTML = `<p class="transcript-empty">⚠ ${err.message}${action}</p>`;
-    $('#grant-failed-path')?.addEventListener('click', grantAndOpenFolder);
+    const error = document.createElement('p'); error.className = 'transcript-empty'; error.textContent = `⚠ ${err.message}`;
+    filetreeEl.replaceChildren(error);
+    if (err.permission_required) {
+      const grant = document.createElement('button'); grant.className = 'mode-button'; grant.type = 'button'; grant.textContent = 'Grant folder access';
+      grant.addEventListener('click', grantAndOpenFolder); error.append(document.createElement('br'), grant);
+    } else {
+      error.append(document.createElement('br'), document.createTextNode('Is gui/server.py running? Use ./wake-up.sh or python3 gui/server.py.'));
+    }
   }
 }
 
@@ -1238,6 +1692,13 @@ codeSaveBtn.addEventListener('click', async () => {
 
 $('#filetree-open-folder').addEventListener('click', grantAndOpenFolder);
 $('#filetree-refresh').addEventListener('click', refreshCodeTree);
+$('#filetree-secrets').addEventListener('click', async () => {
+  showSecretFiles = !showSecretFiles;
+  const button = $('#filetree-secrets');
+  button.textContent = showSecretFiles ? 'Hide Secrets' : 'Show Secrets';
+  button.setAttribute('aria-pressed', String(showSecretFiles));
+  await refreshCodeTree();
+});
 
 $('#filetree-new-file').addEventListener('click', async () => {
   const base = currentActionDir();
@@ -1336,38 +1797,52 @@ function renderCodeTranscript() {
     el.append(p);
     return;
   }
-  for (const entry of codeChatHistory) el.append(renderChatEntry(activeAgent(), entry, 'code-agent'));
+  for (const entry of codeChatHistory) el.append(renderChatEntry(activeAgent(), entry, 'code-agent', 'code'));
   el.scrollTop = el.scrollHeight;
 }
 function appendCodeEntry(entry) {
+  stampEntry(entry);
   codeChatHistory.push(entry);
   saveCodeChat();
   const el = $('#code-transcript');
   el.querySelector('.transcript-empty')?.remove();
-  el.append(renderChatEntry(activeAgent(), entry, 'code-agent'));
+  el.append(renderChatEntry(activeAgent(), entry, 'code-agent', 'code'));
   el.scrollTop = el.scrollHeight;
 }
 renderCodeTranscript();
 $('#code-composer').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (await stopSurfaceRun('code')) return;
   const input = $('#code-composer-input');
   const text = input.value.trim();
   if (!text) return;
+  const project = activeProject();
+  const cwd = currentTreeRoot || project?.path || getDirectory() || '.';
+  const codeAgent = activeAgent();
+  const { payload: effortPayload } = effortForPrompt('code', text);
+  const { run, controller } = await beginRun({
+    surface: 'code', instruction: text, project_id: project?.id || null,
+    cwd, model_key: modelsConfig.active, agent_ids: [codeAgent?.id || 'code-chat'], ...effortPayload, ...consumeRunLineage(),
+  });
+  markSurfaceRun('code', run);
   input.value = '';
   appendCodeEntry({ type: 'user', text });
-  const codeAgent = { id: 'code-chat', name: 'code-chat', modelKey: modelsConfig.active };
-  const chatId = await ensureChat(codeAgent);
+  if (codeAgent) setAgentState(codeAgent, 'thinking');
+  const persistedCodeAgent = { id: 'code-chat', name: 'code-chat', modelKey: modelsConfig.active };
+  const chatId = await ensureChat(persistedCodeAgent);
   const priorMessages = await buildPriorMessages(chatId);
   try {
-    const project = activeProject();
     const docContext = project ? await projectDocsContext(project) : '';
     const fileContext = selectedFilePath ? ` The user currently has ${selectedFilePath} open.` : '';
     const projectContext = project ? ` Active project: ${project.name} at ${project.path}.` : '';
     const content = await runAgentTurn({
       modelKey: modelsConfig.active,
       userText: text, priorMessages,
-      cwd: currentTreeRoot || getDirectory() || null,
+      cwd, signal: controller.signal, runId: run.id, toolProfile: 'code',
+      ...effortRunOptions('code', run),
       systemPrompt: `You are a code assistant embedded in the qwen-harness GUI.${projectContext}${fileContext}\n${docContext}\nUse tools (read_file, edit_file, search_files, run_shell, github_*, etc.) when they'd genuinely help. Be concise.`,
+      onToken: (content) => updateStreamingMessage($('#code-transcript'), codeAgent, run.id, content, 'code-agent'),
+      onApprovalRequest: handleApprovalRequest,
       onEvent: (ev) => {
         if (ev.type === 'usage') {
           trackUsageAndMaybeCompact(chatId, modelsConfig.active, ev.totalTokens, (prompt) =>
@@ -1376,18 +1851,30 @@ $('#code-composer').addEventListener('submit', async (e) => {
           return;
         }
         if (ev.type === 'tool_call') {
+          if (codeAgent) setAgentState(codeAgent, 'working');
+          emitRunEvent(run.id, 'agent.tool.started', { agent_id: codeAgent?.id || 'code-chat', tool: ev.name, args: ev.args });
           if (['write_file', 'edit_file', 'append_file'].includes(ev.name) && ev.args?.path) logWorkDone('code-chat', 'edit', ev.args.path, chatId);
           else if (ev.name === 'read_file' && ev.args?.path) logWorkDone('code-chat', 'read', ev.args.path, chatId);
         }
+        if (ev.type === 'tool_result') emitRunEvent(run.id, 'agent.tool.completed', { agent_id: codeAgent?.id || 'code-chat' });
         appendCodeEntry(ev);
       },
     });
     persistMessage(chatId, 'user', text);
     persistMessage(chatId, 'assistant', content);
     touchChat(chatId, text.slice(0, 80));
+    clearStreamingMessage($('#code-transcript'), run.id);
     appendCodeEntry({ type: 'assistant', text: content || '(empty response)' });
+    await finishRun(run.id, content);
   } catch (err) {
-    appendCodeEntry({ type: 'system', text: `⚠ Live call failed: ${err.message}` });
+    clearStreamingMessage($('#code-transcript'), run.id);
+    if (err.name !== 'AbortError') {
+      appendCodeEntry({ type: 'system', text: `⚠ Live call failed: ${err.message}` });
+      await failRun(run.id, err);
+    }
+  } finally {
+    if (codeAgent) setAgentState(codeAgent, 'idle');
+    clearSurfaceRun('code', run.id);
   }
 });
 trackComposerFocus($('#code-composer-input'));
@@ -1431,6 +1918,7 @@ $('#browser-preview-form').addEventListener('submit', (e) => {
 // ═══════════════════════════════════════════════════════════════════════
 let projects = [];
 let activeProjectId = localStorage.getItem('qh-active-project-v1') || null;
+let selectedProjectDocName = null;
 let projectRepoFormOpen = false;
 let projectWorkspaceOpen = false;
 const PROJECT_AGENT_FEED_KEY = 'qh-project-agent-feed-v1';
@@ -1456,8 +1944,10 @@ function persistProjectMainFeed() {
 
 async function projectDocsContext(project) {
   const docs = (project.documents || []).slice(0, 8);
-  if (docs.length === 0) return '';
   const chunks = [];
+  if (project.index) {
+    chunks.push(`Repository index: ${project.index.file_count} source files and ${project.index.symbol_count} symbols. Use filesystem search/read tools for exact source context.`);
+  }
   for (const doc of docs) {
     try {
       const text = await apiProjectReadDoc(project.id, doc.name);
@@ -1483,7 +1973,10 @@ async function refreshProjects() {
     if (activeProjectId) localStorage.setItem('qh-active-project-v1', activeProjectId);
     renderProjects();
   } catch (err) {
-    $('#project-list').innerHTML = `<p class="transcript-empty">⚠ ${err.message}</p>`;
+    const error = document.createElement('p');
+    error.className = 'transcript-empty';
+    error.textContent = `⚠ ${err.message}`;
+    $('#project-list').replaceChildren(error);
   }
 }
 
@@ -1500,9 +1993,16 @@ function renderProjects() {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'project-card' + (project.id === activeProjectId ? ' is-active' : '');
-    btn.innerHTML = `<strong>${project.name}</strong><span>${project.path}</span><span>${project.documents?.length || 0} docs · ${project.git_exists ? 'git ready' : 'git missing'}</span>`;
+    const title = document.createElement('strong');
+    const path = document.createElement('span');
+    const summary = document.createElement('span');
+    title.textContent = project.name;
+    path.textContent = project.path;
+    summary.textContent = `${project.documents?.length || 0} docs · ${project.git_exists ? 'git ready' : 'git missing'}`;
+    btn.append(title, path, summary);
     btn.addEventListener('click', () => {
       activeProjectId = project.id;
+      selectedProjectDocName = null;
       projectRepoFormOpen = false;
       projectWorkspaceOpen = false;
       localStorage.setItem('qh-active-project-v1', activeProjectId);
@@ -1527,7 +2027,11 @@ function renderProjectDetail() {
   $('#project-repo-create-confirm').disabled = !project;
   $('#project-repo-publish-confirm').disabled = !project;
   $('#project-doc-upload').disabled = !project;
-  for (const btn of document.querySelectorAll('[data-project-git-action], #project-github-create, #project-git-commit, #project-git-checkout, #project-git-merge')) {
+  $('#project-index').disabled = !project;
+  $('#project-doc-rename').disabled = !project || !selectedProjectDocName;
+  $('#project-doc-delete').disabled = !project || !selectedProjectDocName;
+  $('#project-context-query').disabled = !project;
+  for (const btn of document.querySelectorAll('[data-project-git-action], #project-github-create, #project-git-commit, #project-git-checkout, #project-git-merge, #project-worktree-create, #project-worktree-remove, #project-pr-create, #project-issue-create, #project-workflows')) {
     btn.disabled = !project;
   }
   if (!project) {
@@ -1535,6 +2039,8 @@ function renderProjectDetail() {
     $('#project-detail-path').textContent = '—';
     $('#project-doc-list').innerHTML = '<p class="transcript-empty">No project selected.</p>';
     $('#project-doc-title').textContent = 'Context';
+    $('#project-context-status').textContent = 'Repository not indexed.';
+    $('#project-context-results').replaceChildren();
     $('#project-doc-preview').value = '';
     $('#project-github-status').textContent = 'Select a project to publish.';
     $('#project-git-output').textContent = 'Git output will appear here.';
@@ -1559,6 +2065,10 @@ function renderProjectDetail() {
   $('#project-repo-name').value = $('#project-repo-name').value || (project.slug || project.name);
   $('#project-repo-description').value = $('#project-repo-description').value || `${project.name} project`;
   $('#project-duplicate-name').value = `${project.name} copy`;
+  const index = project.index;
+  $('#project-context-status').textContent = index
+    ? `${index.file_count} files · ${index.symbol_count} symbols · indexed ${new Date(index.created_at * 1000).toLocaleString()}`
+    : 'Repository not indexed.';
 
   const docs = $('#project-doc-list');
   docs.replaceChildren();
@@ -1571,9 +2081,17 @@ function renderProjectDetail() {
     for (const doc of project.documents) {
       const row = document.createElement('button');
       row.type = 'button';
-      row.className = 'drawer-list-row';
-      row.innerHTML = `<span>M</span><span>${doc.name}</span>`;
+      row.className = 'drawer-list-row' + (doc.name === selectedProjectDocName ? ' is-selected' : '');
+      const mark = document.createElement('span');
+      const name = document.createElement('span');
+      mark.textContent = 'M';
+      name.textContent = doc.name;
+      row.append(mark, name);
       row.addEventListener('click', async () => {
+        selectedProjectDocName = doc.name;
+        $('#project-doc-rename').disabled = false;
+        $('#project-doc-delete').disabled = false;
+        docs.querySelectorAll('.drawer-list-row').forEach(item => item.classList.toggle('is-selected', item === row));
         $('#project-doc-title').textContent = doc.name;
         $('#project-doc-preview').value = 'Loading…';
         try {
@@ -1591,6 +2109,31 @@ function renderProjectDetail() {
   renderProjectMainFeed(project);
 }
 
+function renderProjectSearchResults(project, results) {
+  const container = $('#project-context-results');
+  container.replaceChildren();
+  if (!results.length) {
+    const empty = document.createElement('p');
+    empty.className = 'transcript-empty';
+    empty.textContent = 'No indexed files or symbols matched.';
+    container.append(empty);
+    return;
+  }
+  for (const result of results) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'context-result';
+    button.textContent = result.symbols?.length ? `${result.path} · ${result.symbols.join(', ')}` : result.path;
+    button.addEventListener('click', async () => {
+      await apiFsGrant(project.path);
+      await loadCodeTree(project.path);
+      await openFile({ type: 'file', path: pathJoin(project.path, result.path) });
+      switchRoute('code');
+    });
+    container.append(button);
+  }
+}
+
 function renderProjectAgentList(project) {
   const list = $('#project-agent-list');
   const selected = new Set(project.settings?.agent_ids || []);
@@ -1598,7 +2141,10 @@ function renderProjectAgentList(project) {
   for (const agent of agents) {
     const label = document.createElement('label');
     label.className = 'project-agent-choice';
-    label.innerHTML = `<input type="checkbox" value="${agent.id}" ${selected.has(agent.id) ? 'checked' : ''} /><span>${agent.name}</span><small>${displayName(agent)}</small>`;
+    const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.value = agent.id; checkbox.checked = selected.has(agent.id);
+    const name = document.createElement('span'); name.textContent = agent.name;
+    const display = document.createElement('small'); display.textContent = displayName(agent);
+    label.append(checkbox, name, display);
     list.append(label);
   }
 }
@@ -1614,11 +2160,14 @@ function renderProjectComposer(project) {
   const modelSel = $('#project-model-select');
   targetSel.replaceChildren();
   const selected = projectSelectedAgents(project);
+  const auto = document.createElement('option');
+  auto.value = '__auto__'; auto.textContent = 'Auto plan & assign';
+  targetSel.append(auto);
   const all = document.createElement('option');
   all.value = '__project__';
   all.textContent = selected.length > 1 ? 'Project agents' : (selected[0]?.name || 'Active agent');
   targetSel.append(all);
-  for (const agent of selected) {
+  for (const agent of selected.length > 1 ? selected : []) {
     const opt = document.createElement('option');
     opt.value = agent.id;
     opt.textContent = agent.name;
@@ -1647,12 +2196,13 @@ function renderProjectMainFeed(project) {
   }
   for (const row of rows.slice(-60)) {
     const agent = agents.find(a => a.name === row.agent || a.id === row.agent);
-    feed.append(renderChatEntry(agent, row.entry, row.agent || 'project'));
+    feed.append(renderChatEntry(agent, row.entry, row.agent || 'project', 'project'));
   }
   feed.scrollTop = feed.scrollHeight;
 }
 
 function appendProjectMainFeed(project, agentName, entry) {
+  stampEntry(entry);
   if (!projectMainFeed[project.id]) projectMainFeed[project.id] = [];
   projectMainFeed[project.id].push({ agent: agentName, entry });
   projectMainFeed[project.id] = projectMainFeed[project.id].slice(-120);
@@ -1673,12 +2223,13 @@ function renderProjectAgentFeed(project) {
   }
   for (const row of rows.slice(-40)) {
     const agent = agents.find(a => a.name === row.agent || a.id === row.agent);
-    feed.append(renderChatEntry(agent, row.entry, row.agent || 'project'));
+    feed.append(renderChatEntry(agent, row.entry, row.agent || 'project', 'project'));
   }
   feed.scrollTop = feed.scrollHeight;
 }
 
 function appendProjectAgentFeed(project, agentName, entry) {
+  stampEntry(entry);
   if (!projectAgentFeed[project.id]) projectAgentFeed[project.id] = [];
   projectAgentFeed[project.id].push({ agent: agentName, entry });
   projectAgentFeed[project.id] = projectAgentFeed[project.id].slice(-80);
@@ -1698,6 +2249,7 @@ function setGitOutput(label, payload) {
     git?.stdout || '',
     git?.stderr || '',
     payload?.github?.html_url ? `GitHub: ${payload.github.html_url}` : '',
+    payload?.github?.workflows ? payload.github.workflows.map(item => `${item.id}  ${item.state}  ${item.name} (${item.path})`).join('\n') : '',
   ].filter(Boolean).join('\n');
   output.textContent = text || `${label}\nDone.`;
 }
@@ -1836,6 +2388,77 @@ $('#project-doc-upload').addEventListener('change', async () => {
   }
 });
 
+$('#project-index').addEventListener('click', async () => {
+  const project = activeProject();
+  if (!project) return;
+  const button = $('#project-index');
+  button.disabled = true;
+  button.textContent = 'Indexing...';
+  $('#project-context-status').textContent = 'Reading repository structure and symbols...';
+  try {
+    const result = await apiProjectIndex(project.id);
+    projects = projects.map(item => item.id === result.project.id ? result.project : item);
+    renderProjects();
+    setProjectStatus(`Indexed ${result.index.file_count} files and ${result.index.symbol_count} symbols.`);
+  } catch (err) {
+    setProjectStatus(err.message, true);
+    $('#project-context-status').textContent = err.message;
+  } finally {
+    button.textContent = 'Index Repo';
+    button.disabled = !activeProject();
+  }
+});
+
+$('#project-doc-rename').addEventListener('click', async () => {
+  const project = activeProject();
+  if (!project || !selectedProjectDocName) return;
+  const nextName = prompt('Rename project document:', selectedProjectDocName)?.trim();
+  if (!nextName || nextName === selectedProjectDocName) return;
+  try {
+    const result = await apiProjectRenameDoc(project.id, selectedProjectDocName, nextName);
+    selectedProjectDocName = result.name;
+    projects = projects.map(item => item.id === result.project.id ? result.project : item);
+    renderProjects();
+    $('#project-doc-title').textContent = result.name;
+    setProjectStatus(`Renamed document to ${result.name}.`);
+  } catch (err) {
+    setProjectStatus(err.message, true);
+  }
+});
+
+$('#project-doc-delete').addEventListener('click', async () => {
+  const project = activeProject();
+  if (!project || !selectedProjectDocName) return;
+  const name = selectedProjectDocName;
+  if (!confirm(`Delete ${name} from this project's context dock?`)) return;
+  try {
+    const result = await apiProjectDeleteDoc(project.id, name);
+    selectedProjectDocName = null;
+    projects = projects.map(item => item.id === result.project.id ? result.project : item);
+    $('#project-doc-title').textContent = 'Context';
+    $('#project-doc-preview').value = '';
+    renderProjects();
+    setProjectStatus(`Deleted ${name}.`);
+  } catch (err) {
+    setProjectStatus(err.message, true);
+  }
+});
+
+$('#project-context-search').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const project = activeProject();
+  const query = $('#project-context-query').value.trim();
+  if (!project || !query) return;
+  const container = $('#project-context-results');
+  container.textContent = 'Searching index...';
+  try {
+    const result = await apiProjectSearch(project.id, query);
+    renderProjectSearchResults(project, result.results || []);
+  } catch (err) {
+    container.textContent = err.message;
+  }
+});
+
 $('#project-open-working-dir').addEventListener('click', async () => {
   const project = activeProject();
   if (!project) return;
@@ -1846,6 +2469,7 @@ $('#project-open-working-dir').addEventListener('click', async () => {
 });
 
 async function sendProjectMessage() {
+  if (await stopSurfaceRun('project')) return;
   const project = activeProject();
   if (!project) return;
   const input = $('#project-composer-input');
@@ -1857,6 +2481,15 @@ async function sendProjectMessage() {
   const targets = targetId === '__project__' ? selectedAgents : selectedAgents.filter(agent => agent.id === targetId);
   const modelKey = $('#project-model-select').value;
   const context = await projectDocsContext(project);
+  if (targetId === '__auto__') {
+    return runAutoOrchestration({ surface: 'project', instruction: text, project, modelKey, pool: selectedAgents.length > 1 ? selectedAgents : agents });
+  }
+  const { payload: effortPayload } = effortForPrompt('project', text);
+  const { run, controller } = await beginRun({
+    surface: 'project', instruction: text, project_id: project.id, cwd: project.path,
+    model_key: modelKey, agent_ids: targets.map(agent => agent.id), ...effortPayload, ...consumeRunLineage(),
+  });
+  markSurfaceRun('project', run);
   for (const agent of targets) {
     const entry = { type: 'user', text };
     appendProjectMainFeed(project, agent.name, entry);
@@ -1864,17 +2497,23 @@ async function sendProjectMessage() {
     setAgentState(agent, 'listening');
   }
   await sleep(200);
-  for (const agent of targets) setAgentState(agent, 'thinking');
-  await Promise.all(targets.map(async (agent) => {
+  for (const agent of targets) {
+    setAgentState(agent, 'thinking');
+    emitRunEvent(run.id, 'agent.thinking', { agent_id: agent.id, agent_name: agent.name });
+  }
+  const outcomes = await Promise.all(targets.map(async (agent) => {
     const chatId = await ensureChat(agent);
     const priorMessages = await buildPriorMessages(chatId);
     try {
       const reply = await runAgentTurn({
         modelKey,
         userText: text, priorMessages,
-        cwd: project.path,
+        cwd: project.path, signal: controller.signal, runId: run.id, toolProfile: 'project',
+        ...effortRunOptions('project', run),
         systemPrompt: `You are working inside project "${project.name}" at ${project.path}. This is the primary project control room: use terminal, browser preview, filesystem, GitHub, and other tools when they genuinely help.\n${context}`,
-        onEvent: (ev) => {
+        onToken: (content) => updateStreamingMessage($('#project-main-feed'), agent, `${run.id}:${agent.id}`, content, agent.name),
+        onApprovalRequest: handleApprovalRequest,
+      onEvent: (ev) => {
           if (ev.type === 'usage') {
             trackUsageAndMaybeCompact(chatId, modelKey, ev.totalTokens, (prompt) =>
               runAgentTurn({ modelKey, userText: prompt, systemPrompt: 'You summarize conversations concisely.' })
@@ -1883,9 +2522,11 @@ async function sendProjectMessage() {
           }
           if (ev.type === 'tool_call') {
             setAgentState(agent, 'working');
+            emitRunEvent(run.id, 'agent.tool.started', { agent_id: agent.id, tool: ev.name, args: ev.args });
             if (['write_file', 'edit_file', 'append_file'].includes(ev.name) && ev.args?.path) logWorkDone(agent.id, 'edit', ev.args.path, chatId, `project: ${project.name}`);
             else if (ev.name === 'read_file' && ev.args?.path) logWorkDone(agent.id, 'read', ev.args.path, chatId, `project: ${project.name}`);
           }
+          if (ev.type === 'tool_result') emitRunEvent(run.id, 'agent.tool.completed', { agent_id: agent.id });
           appendProjectMainFeed(project, agent.name, ev);
           appendEntry(agent, ev);
         },
@@ -1894,18 +2535,29 @@ async function sendProjectMessage() {
       persistMessage(chatId, 'assistant', reply);
       touchChat(chatId, `[${project.name}] ${text.slice(0, 70)}`);
       const entry = { type: 'assistant', text: reply || '(empty response)' };
+      clearStreamingMessage($('#project-main-feed'), `${run.id}:${agent.id}`);
       appendProjectMainFeed(project, agent.name, entry);
       appendEntry(agent, entry);
       setAgentState(agent, 'happy');
+      emitRunEvent(run.id, 'agent.completed', { agent_id: agent.id });
+      return { agent: agent.name, reply };
     } catch (err) {
+      clearStreamingMessage($('#project-main-feed'), `${run.id}:${agent.id}`);
+      if (err.name === 'AbortError') return { agent: agent.name, cancelled: true };
       const entry = { type: 'system', text: err.message };
       appendProjectMainFeed(project, agent.name, entry);
       appendEntry(agent, entry);
       setAgentState(agent, 'confused');
+      emitRunEvent(run.id, 'agent.failed', { agent_id: agent.id, error: err.message });
+      return { agent: agent.name, error: err.message };
     }
-    await sleep(900);
-    setAgentState(agent, 'idle');
   }));
+  for (const agent of targets) setAgentState(agent, 'idle');
+  if (controller.signal.aborted) { clearSurfaceRun('project', run.id); return; }
+  const failures = outcomes.filter(result => result?.error);
+  if (failures.length === outcomes.length) await failRun(run.id, failures.map(item => item.error).join('; '));
+  else await finishRun(run.id, outcomes);
+  clearSurfaceRun('project', run.id);
 }
 
 $('#project-send').addEventListener('click', sendProjectMessage);
@@ -1930,6 +2582,66 @@ for (const [id, action, label] of [
     await runProjectGitAction(action, { approved }, label);
   });
 }
+
+for (const [action, label, needsApproval] of [
+  ['diff', 'Working tree diff', false],
+  ['stage', 'Stage all changes', true],
+  ['unstage', 'Unstage all changes', true],
+  ['worktrees', 'Git worktrees', false],
+]) {
+  const btn = document.querySelector(`.git-inspector [data-project-git-action="${action}"]`);
+  btn.addEventListener('click', async () => {
+    if (needsApproval && !confirm(`${label} for "${activeProject()?.name}"?`)) return;
+    await runProjectGitAction(action, { approved: needsApproval }, label);
+  });
+}
+
+$('#project-worktree-create').addEventListener('click', async () => {
+  const project = activeProject();
+  if (!project) return;
+  const branch = prompt('New worktree branch name:');
+  if (!branch) return;
+  const suggested = `${dirname(project.path)}/${basename(project.path)}-${branch.replace(/[^A-Za-z0-9._-]+/g, '-')}`;
+  const path = prompt('Worktree folder:', suggested);
+  if (!path || !confirm(`Create branch "${branch}" in linked worktree ${path}?`)) return;
+  await runProjectGitAction('worktree_create', { branch, path, create: true, approved: true }, 'Create worktree');
+});
+
+$('#project-worktree-remove').addEventListener('click', async () => {
+  const project = activeProject();
+  if (!project) return;
+  const path = prompt('Exact linked worktree folder to remove:');
+  if (!path || !confirm(`Remove linked worktree ${path}? Uncommitted changes will prevent removal.`)) return;
+  await runProjectGitAction('worktree_remove', { path, approved: true }, 'Remove worktree');
+});
+
+$('#project-pr-create').addEventListener('click', async () => {
+  const title = prompt('Pull request title:');
+  if (!title) return;
+  const head = prompt('Head branch:', 'feature');
+  if (!head) return;
+  const base = prompt('Base branch:', 'main') || 'main';
+  const body = prompt('Pull request description:', '') || '';
+  if (!confirm(`Create pull request ${head} → ${base}?`)) return;
+  await runProjectGitAction('pr_create', { title, head, base, body, approved: true }, 'Create pull request');
+});
+
+$('#project-issue-create').addEventListener('click', async () => {
+  const title = prompt('Issue title:');
+  if (!title) return;
+  const body = prompt('Issue description:', '') || '';
+  if (!confirm(`Create GitHub issue "${title}"?`)) return;
+  await runProjectGitAction('issue_create', { title, body, approved: true }, 'Create issue');
+});
+
+$('#project-workflows').addEventListener('click', async () => {
+  await runProjectGitAction('workflows', {}, 'GitHub Actions workflows');
+  const workflow = prompt('Enter a workflow id or filename to run, or leave blank to only view the list:');
+  if (!workflow) return;
+  const ref = prompt('Git ref:', 'main') || 'main';
+  if (!confirm(`Dispatch workflow ${workflow} on ${ref}?`)) return;
+  await runProjectGitAction('workflow_dispatch', { workflow, ref, approved: true }, 'Dispatch workflow');
+});
 
 $('#project-github-create').addEventListener('click', async () => {
   const project = activeProject();
@@ -2039,6 +2751,8 @@ $('#project-agent-composer').addEventListener('submit', async (e) => {
   input.value = '';
   const targets = projectSelectedAgents(project);
   const context = await projectDocsContext(project);
+  const projectAgentEffort = getEffort('project-agent', text);
+  lockEffort('project-agent', true);
   for (const agent of targets) {
     const entry = { type: 'user', text };
     appendProjectAgentFeed(project, agent.name, entry);
@@ -2053,8 +2767,12 @@ $('#project-agent-composer').addEventListener('submit', async (e) => {
         modelKey: agent.modelKey,
         userText: text,
         cwd: project.path,
+        toolProfile: 'project',
+        effort: projectAgentEffort.level,
+        onEffortEscalation: ({ level = 4 }) => escalateEffort('project-agent', level),
         systemPrompt: `You are working inside project "${project.name}" at ${project.path}. Use the document context and tools when useful.\n${context}`,
-        onEvent: (ev) => {
+        onApprovalRequest: handleApprovalRequest,
+      onEvent: (ev) => {
           if (ev.type === 'tool_call') setAgentState(agent, 'working');
           appendProjectAgentFeed(project, agent.name, ev);
           appendEntry(agent, ev);
@@ -2073,6 +2791,7 @@ $('#project-agent-composer').addEventListener('submit', async (e) => {
     await sleep(900);
     setAgentState(agent, 'idle');
   }));
+  lockEffort('project-agent', false);
 });
 
 $('#project-duplicate').addEventListener('click', async () => {
@@ -2217,7 +2936,7 @@ async function renderHub() {
     row.append(charField, modelField);
 
     const actions = document.createElement('div'); actions.className = 'hub-card-actions';
-    const stateBadge = document.createElement('span'); stateBadge.className = 'roster-state'; stateBadge.textContent = agent.state;
+    const stateBadge = document.createElement('span'); stateBadge.className = 'roster-state'; stateBadge.append(createActivityIndicator(agent.state, { size: 15, label: agent.state }));
     const btnGroup = document.createElement('div'); btnGroup.style.display = 'flex'; btnGroup.style.gap = '8px';
     const openBtn = document.createElement('button'); openBtn.type = 'button'; openBtn.className = 'hub-open'; openBtn.textContent = 'Open in console →';
     openBtn.addEventListener('click', () => { $('#hub-console-body').hidden = false; $('#hub-console-caret').textContent = '▾'; selectAgent(agent.id); });
@@ -2303,7 +3022,7 @@ function renderTranscript() {
     el.append(p);
     return;
   }
-  for (const entry of agent.transcript) el.append(renderChatEntry(agent, entry, agent.name));
+  for (const entry of agent.transcript) el.append(renderChatEntry(agent, entry, agent.name, 'hub'));
   el.scrollTop = el.scrollHeight;
 }
 
@@ -2365,28 +3084,52 @@ setHubMode('demo');
 
 $('#composer').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (await stopSurfaceRun('hub')) return;
   const input = $('#composer-input');
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
   const agent = agents.find(a => a.id === activeAgentId);
   if (hubMode === 'live') {
+    const cwd = getDirectory() || '.';
+    const { payload: effortPayload } = effortForPrompt('hub', text);
+    const { run, controller } = await beginRun({
+      surface: 'hub', instruction: text, cwd, model_key: agent.modelKey, agent_ids: [agent.id], ...effortPayload, ...consumeRunLineage(),
+    });
+    markSurfaceRun('hub', run);
     appendEntry(agent, { type: 'user', text });
     setAgentState(agent, 'listening'); await sleep(250); setAgentState(agent, 'thinking');
+    emitRunEvent(run.id, 'agent.thinking', { agent_id: agent.id, agent_name: agent.name });
     try {
       const content = await runAgentTurn({
         modelKey: agent.modelKey, userText: text,
-        cwd: getDirectory() || null,
+        cwd, signal: controller.signal, runId: run.id, toolProfile: 'hub',
+        ...effortRunOptions('hub', run),
         systemPrompt: 'You are a concise, helpful assistant. Use tools when they would genuinely help.',
-        onEvent: (ev) => { if (ev.type === 'tool_call') setAgentState(agent, 'working'); appendEntry(agent, ev); },
+        onToken: (content) => updateStreamingMessage($('#transcript'), agent, run.id, content, agent.name),
+        onApprovalRequest: handleApprovalRequest,
+      onEvent: (ev) => {
+          if (ev.type === 'tool_call') {
+            setAgentState(agent, 'working');
+            emitRunEvent(run.id, 'agent.tool.started', { agent_id: agent.id, tool: ev.name, args: ev.args });
+          }
+          if (ev.type === 'tool_result') emitRunEvent(run.id, 'agent.tool.completed', { agent_id: agent.id });
+          appendEntry(agent, ev);
+        },
       });
       appendEntry(agent, { type: 'assistant', text: content || '(empty response)' });
+      clearStreamingMessage($('#transcript'), run.id);
       setAgentState(agent, 'happy');
+      await finishRun(run.id, content);
     } catch (err) {
-      appendEntry(agent, { type: 'system', text: `⚠ Live call failed: ${err.message}.` });
-      setAgentState(agent, 'confused');
+      clearStreamingMessage($('#transcript'), run.id);
+      if (err.name !== 'AbortError') {
+        appendEntry(agent, { type: 'system', text: `⚠ Live call failed: ${err.message}.` });
+        setAgentState(agent, 'confused');
+        await failRun(run.id, err);
+      }
     }
-    await sleep(1200); setAgentState(agent, 'idle');
+    await sleep(350); setAgentState(agent, 'idle'); clearSurfaceRun('hub', run.id);
   } else {
     appendEntry(agent, { type: 'user', text });
     setAgentState(agent, 'listening'); await sleep(400); setAgentState(agent, 'thinking'); await sleep(900);
@@ -2395,6 +3138,32 @@ $('#composer').addEventListener('submit', async (e) => {
   }
 });
 trackComposerFocus($('#composer-input'));
+
+window.addEventListener('qh-retry-run', async ({ detail: run }) => {
+  retryParentRun = run;
+  setActivityDrawer(false);
+  if (run.surface === 'project' && run.project_id) {
+    activeProjectId = run.project_id;
+    projectWorkspaceOpen = true;
+    switchRoute('projects');
+    await refreshProjects();
+    $('#project-composer-input').value = run.instruction;
+    return sendProjectMessage();
+  }
+  if (run.surface === 'code') {
+    switchRoute('code');
+    $('#code-composer-input').value = run.instruction;
+    return $('#code-composer').requestSubmit();
+  }
+  if (run.surface === 'hub') {
+    switchRoute('hub'); setHubMode('live');
+    $('#composer-input').value = run.instruction;
+    return $('#composer').requestSubmit();
+  }
+  switchRoute('home');
+  $('#home-composer-input').value = run.instruction;
+  return sendHomeMessage();
+});
 
 // ═══════════════════════════════════════════════════════════════════════
 // theme, router, status polling, boot
@@ -2483,7 +3252,8 @@ async function pollResourceMonitor() {
           chip.className = 'resource-task-chip';
           const cpu = t.cpu_pct != null ? `${t.cpu_pct.toFixed(0)}%` : '?';
           const mem = t.mem_mb != null ? `${(t.mem_mb / 1024).toFixed(1)}GB` : '?';
-          chip.innerHTML = `<span class="rt-dot"></span>${t.model} · ${cpu} CPU · ${mem}`;
+          const dot = document.createElement('span'); dot.className = 'rt-dot';
+          chip.append(dot, document.createTextNode(`${t.model} · ${cpu} CPU · ${mem}`));
           tasksEl.append(chip);
         }
       }
@@ -2503,9 +3273,11 @@ await refreshGrants();
 await refreshProjects();
 await loadCodeTree(getDirectory() || '.');
 pollBackend(); pollOllama(); pollResourceMonitor();
+renderActivityDrawer();
 setInterval(pollBackend, 8000);
 setInterval(pollOllama, 5000);
 setInterval(pollResourceMonitor, 3000);
+setInterval(renderActivityDrawer, 3000);
 // Projects are shared, on-disk state (~/.qwen-harness/projects.json) that
 // any client (this browser tab, another tab, the Mac app) can mutate — so
 // while the Projects view is open, poll for changes made elsewhere instead

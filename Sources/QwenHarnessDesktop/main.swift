@@ -2,8 +2,10 @@ import AppKit
 import Foundation
 import WebKit
 import Darwin
+import OSLog
 
 private let defaultPort = 8420
+private let logger = Logger(subsystem: "local.qwen-harness.desktop", category: "lifecycle")
 
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private var window: NSWindow!
@@ -15,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installApplicationIcon()
+        buildMenus()
         buildWindow()
         startHarness()
         NSApp.activate(ignoringOtherApps: true)
@@ -31,6 +34,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     func applicationWillTerminate(_ notification: Notification) {
         serverProcess?.terminate()
+        ollamaProcess?.terminate()
+        logger.info("Application terminating")
     }
 
     private func buildWindow() {
@@ -43,10 +48,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         webView.navigationDelegate = self
         webView.uiDelegate = self
 
-        let reloadButton = NSButton(title: "Reload", target: self, action: #selector(reloadPage))
+        let reloadButton = NSButton(image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Reload")!, target: self, action: #selector(reloadPage))
         reloadButton.bezelStyle = .rounded
-        let browserButton = NSButton(title: "Open in Browser", target: self, action: #selector(openInBrowser))
+        reloadButton.toolTip = "Reload"
+        let browserButton = NSButton(image: NSImage(systemSymbolName: "safari", accessibilityDescription: "Open in Browser")!, target: self, action: #selector(openInBrowser))
         browserButton.bezelStyle = .rounded
+        browserButton.toolTip = "Open in Browser"
         statusItem = NSTextField(labelWithString: "Starting harness...")
         statusItem.lineBreakMode = .byTruncatingTail
         statusItem.textColor = .secondaryLabelColor
@@ -73,8 +80,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         )
         window.title = "Qwen Harness"
         window.isReleasedWhenClosed = false
+        window.setFrameAutosaveName("QwenHarnessMainWindow")
         window.contentView = root
-        window.center()
+        if !window.setFrameUsingName("QwenHarnessMainWindow") { window.center() }
 
         NSLayoutConstraint.activate([
             toolbar.topAnchor.constraint(equalTo: root.topAnchor),
@@ -89,6 +97,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         ])
 
         showMainWindow()
+        logger.info("Main window created")
+    }
+
+    private func buildMenus() {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About Qwen Harness", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Qwen Harness", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+
+        let viewItem = NSMenuItem()
+        main.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        viewMenu.addItem(withTitle: "Reload", action: #selector(reloadPage), keyEquivalent: "r").target = self
+        viewMenu.addItem(withTitle: "Open in Browser", action: #selector(openInBrowser), keyEquivalent: "b").target = self
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
+        viewItem.submenu = viewMenu
+        NSApp.mainMenu = main
     }
 
     private func installApplicationIcon() {
@@ -126,6 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 self.serverProcess = server.process
                 self.appURL = url
                 self.statusItem.stringValue = "Qwen Harness running at \(url.absoluteString)"
+                logger.info("Harness ready at \(url.absoluteString, privacy: .public)")
                 self.showMainWindow()
                 self.webView.load(URLRequest(url: url))
             }
@@ -165,7 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             try process.run()
             ollamaProcess = process
         } catch {
-            NSLog("Could not start Ollama: \(error.localizedDescription)")
+            logger.error("Could not start Ollama: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -193,7 +224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             try process.run()
             return process
         } catch {
-            NSLog("Could not start gui/server.py: \(error.localizedDescription)")
+            logger.error("Could not start gui/server.py: \(error.localizedDescription, privacy: .public)")
             return nil
         }
     }
@@ -288,6 +319,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     @objc private func openInBrowser() {
         if let appURL {
             NSWorkspace.shared.open(appURL)
+        }
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel)
+            return
+        }
+        let isLocalApp = url.scheme == "http" && url.host == "127.0.0.1" && url.port == appURL?.port
+        if isLocalApp || url.scheme == "about" {
+            decisionHandler(.allow)
+        } else if navigationAction.navigationType == .linkActivated || navigationAction.targetFrame == nil {
+            NSWorkspace.shared.open(url)
+            decisionHandler(.cancel)
+        } else {
+            logger.warning("Blocked web view navigation to \(url.absoluteString, privacy: .public)")
+            decisionHandler(.cancel)
         }
     }
 

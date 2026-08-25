@@ -1,4 +1,8 @@
--- qwen-harness — Supabase schema (DRAFT for review, not yet run)
+-- qwen-harness legacy single-file bootstrap.
+--
+-- The authoritative, production schema is versioned in supabase/migrations/.
+-- Apply every numbered migration in supabase/migrations in order. This file remains for
+-- compatibility with earlier installs and should not be used for new setup.
 --
 -- Run this yourself in the Supabase SQL editor (or `supabase db execute`)
 -- once we've confirmed the design. Nothing in this repo runs it automatically.

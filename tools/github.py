@@ -15,11 +15,11 @@ or from the GUI's Connectors panel (GitHub card).
 
 from __future__ import annotations
 import json
-import os
-import stat
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from tools.policy import atomic_write_json
 
 SECRETS_PATH = Path.home() / ".qwen-harness" / "secrets.json"
 API_ROOT = "https://api.github.com"
@@ -36,9 +36,7 @@ def _load_secrets() -> dict:
 
 
 def _save_secrets(data: dict) -> None:
-    SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SECRETS_PATH.write_text(json.dumps(data, indent=2))
-    os.chmod(SECRETS_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 600 — owner read/write only
+    atomic_write_json(SECRETS_PATH, data)
 
 
 def _token() -> str | None:
@@ -163,6 +161,40 @@ def gh_create_issue(owner: str, repo: str, title: str, body: str = "") -> dict:
     try:
         result = _request(f"/repos/{owner}/{repo}/issues", method="POST", body={"title": title, "body": body})
         return {"status": "ok", "number": result.get("number"), "html_url": result.get("html_url")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def gh_create_pull_request(owner: str, repo: str, title: str, head: str, base: str = "main", body: str = "") -> dict:
+    """Create a pull request from an existing remote branch."""
+    try:
+        result = _request(f"/repos/{owner}/{repo}/pulls", method="POST", body={
+            "title": title, "head": head, "base": base, "body": body,
+        })
+        return {"status": "ok", "number": result.get("number"), "html_url": result.get("html_url")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def gh_list_workflows(owner: str, repo: str) -> dict:
+    """List GitHub Actions workflows for a repository."""
+    try:
+        result = _request(f"/repos/{owner}/{repo}/actions/workflows?per_page=100")
+        return {"status": "ok", "workflows": [
+            {"id": item.get("id"), "name": item.get("name"), "path": item.get("path"), "state": item.get("state")}
+            for item in result.get("workflows", [])
+        ]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def gh_dispatch_workflow(owner: str, repo: str, workflow: str, ref: str = "main", inputs: dict | None = None) -> dict:
+    """Dispatch a workflow by numeric id or workflow filename."""
+    try:
+        _request(f"/repos/{owner}/{repo}/actions/workflows/{workflow}/dispatches", method="POST", body={
+            "ref": ref, "inputs": inputs or {},
+        })
+        return {"status": "ok", "workflow": workflow, "ref": ref}
     except Exception as e:
         return {"error": str(e)}
 

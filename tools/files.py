@@ -7,10 +7,15 @@ import os
 import subprocess
 from pathlib import Path
 
+from tools.policy import PermissionDenied, require_path
 
-def read_file(path: str) -> dict:
+
+def read_file(path: str, cwd: str | None = None) -> dict:
     """Read and return the contents of a file."""
-    p = Path(path).expanduser()
+    try:
+        p = require_path(path, cwd)
+    except PermissionDenied as exc:
+        return {"error": str(exc), "permission_required": True, "path": str(exc.path)}
     if not p.exists():
         return {"error": f"File not found: {path}"}
     try:
@@ -20,9 +25,12 @@ def read_file(path: str) -> dict:
         return {"error": str(e)}
 
 
-def write_file(path: str, content: str) -> dict:
+def write_file(path: str, content: str, cwd: str | None = None) -> dict:
     """Write content to a file, creating parent directories as needed."""
-    p = Path(path).expanduser()
+    try:
+        p = require_path(path, cwd, parent=True)
+    except PermissionDenied as exc:
+        return {"error": str(exc), "permission_required": True, "path": str(exc.path)}
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -31,9 +39,12 @@ def write_file(path: str, content: str) -> dict:
         return {"error": str(e)}
 
 
-def append_file(path: str, content: str) -> dict:
+def append_file(path: str, content: str, cwd: str | None = None) -> dict:
     """Append content to a file."""
-    p = Path(path).expanduser()
+    try:
+        p = require_path(path, cwd, parent=True)
+    except PermissionDenied as exc:
+        return {"error": str(exc), "permission_required": True, "path": str(exc.path)}
     try:
         with open(p, "a", encoding="utf-8") as f:
             f.write(content)
@@ -42,9 +53,12 @@ def append_file(path: str, content: str) -> dict:
         return {"error": str(e)}
 
 
-def list_dir(path: str) -> dict:
+def list_dir(path: str, cwd: str | None = None) -> dict:
     """List the contents of a directory."""
-    p = Path(path).expanduser()
+    try:
+        p = require_path(path, cwd)
+    except PermissionDenied as exc:
+        return {"error": str(exc), "permission_required": True, "path": str(exc.path)}
     if not p.exists():
         return {"error": f"Path not found: {path}"}
     if not p.is_dir():
@@ -62,7 +76,7 @@ def list_dir(path: str) -> dict:
         return {"error": str(e)}
 
 
-def run_shell(command: str, timeout: int = 30) -> dict:
+def run_shell(command: str, timeout: int = 30, cwd: str | None = None) -> dict:
     """
     Run a shell command. Returns stdout, stderr, and return code.
     Restricted: no sudo, no rm -rf.
@@ -74,12 +88,16 @@ def run_shell(command: str, timeout: int = 30) -> dict:
             return {"error": f"Blocked dangerous command pattern: '{d}'"}
 
     try:
+        working_dir = require_path(cwd or ".")
+        if not working_dir.is_dir():
+            return {"error": f"Working directory is not a directory: {working_dir}"}
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=working_dir,
         )
         return {
             "status": "ok",
@@ -87,20 +105,25 @@ def run_shell(command: str, timeout: int = 30) -> dict:
             "stdout": result.stdout[:5000],
             "stderr": result.stderr[:2000],
         }
+    except PermissionDenied as exc:
+        return {"error": str(exc), "permission_required": True, "path": str(exc.path)}
     except subprocess.TimeoutExpired:
         return {"error": f"Command timed out after {timeout}s"}
     except Exception as e:
         return {"error": str(e)}
 
 
-def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict:
+def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False, cwd: str | None = None) -> dict:
     """
     Surgical in-place edit: replace old_string with new_string in a file.
     Far safer than write_file for changing existing code — the rest of the
     file is untouched. old_string must match exactly (including whitespace)
     and, unless replace_all, must be unique in the file.
     """
-    p = Path(path).expanduser()
+    try:
+        p = require_path(path, cwd)
+    except PermissionDenied as exc:
+        return {"error": str(exc), "permission_required": True, "path": str(exc.path)}
     if not p.exists():
         return {"error": f"File not found: {path}"}
     try:
@@ -120,13 +143,16 @@ def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = F
     return {"status": "ok", "path": str(p), "replacements": count if replace_all else 1}
 
 
-def search_files(query: str, path: str = ".", glob: str | None = None, max_results: int = 30) -> dict:
+def search_files(query: str, path: str = ".", glob: str | None = None, max_results: int = 30, cwd: str | None = None) -> dict:
     """
     Search file contents recursively for a string/regex (like grep -rn).
     Returns matching lines with file:line locations. Optional glob filters
     filenames (e.g. "*.py").
     """
-    p = Path(path).expanduser()
+    try:
+        p = require_path(path, cwd)
+    except PermissionDenied as exc:
+        return {"error": str(exc), "permission_required": True, "path": str(exc.path)}
     if not p.exists():
         return {"error": f"Path not found: {path}"}
     args = ["grep", "-rn", "--binary-files=without-match",
@@ -150,9 +176,12 @@ def search_files(query: str, path: str = ".", glob: str | None = None, max_resul
     return {"status": "ok", "query": query, "matches": matches, "truncated": len(lines) > max_results}
 
 
-def find_files(pattern: str, path: str = ".", max_results: int = 50) -> dict:
+def find_files(pattern: str, path: str = ".", max_results: int = 50, cwd: str | None = None) -> dict:
     """Find files by name glob (e.g. "*.py", "test_*") recursively under path."""
-    p = Path(path).expanduser()
+    try:
+        p = require_path(path, cwd)
+    except PermissionDenied as exc:
+        return {"error": str(exc), "permission_required": True, "path": str(exc.path)}
     if not p.exists():
         return {"error": f"Path not found: {path}"}
     try:

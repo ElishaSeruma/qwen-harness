@@ -20,8 +20,8 @@ async function readJsonResponse(res, fallback) {
   return data;
 }
 
-export async function apiListDir(path) {
-  const res = await fetch(`${API}/api/fs/list?path=${encodeURIComponent(path || '')}`);
+export async function apiListDir(path, showSecrets = false) {
+  const res = await fetch(`${API}/api/fs/list?path=${encodeURIComponent(path || '')}&show_secrets=${showSecrets ? '1' : '0'}`);
   return readJsonResponse(res, `list failed (${res.status})`);
 }
 export async function apiReadFile(path) {
@@ -91,10 +91,10 @@ export async function apiToolsList() {
   const res = await fetch(`${API}/api/tools/list`, { cache: 'no-store' });
   return readJsonResponse(res, `tools list failed (${res.status})`);
 }
-export async function apiToolCall(name, args) {
+export async function apiToolCall(name, args, context = {}) {
   const res = await fetch(`${API}/api/tools/call`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, args }),
+    body: JSON.stringify({ name, args, context }),
   });
   const data = await readJsonResponse(res, `tool call failed (${res.status})`);
   return data.result;
@@ -108,6 +108,44 @@ export async function apiHealth() {
 export async function apiSystemStats() {
   const res = await fetch(`${API}/api/system/stats`, { cache: 'no-store' });
   return readJsonResponse(res, `system stats failed (${res.status})`);
+}
+
+// ── Durable runs ────────────────────────────────────────────────────────
+export async function apiRuns(projectId = null, limit = 50) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (projectId) params.set('project_id', projectId);
+  const res = await fetch(`${API}/api/runs?${params}`, { cache: 'no-store' });
+  return readJsonResponse(res, `runs failed (${res.status})`);
+}
+export async function apiRunCreate(payload) {
+  const res = await fetch(`${API}/api/runs/create`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `run create failed (${res.status})`);
+}
+export async function apiRunEvent(runId, type, data = {}) {
+  const res = await fetch(`${API}/api/runs/event`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ run_id: runId, type, data }),
+  });
+  return readJsonResponse(res, `run event failed (${res.status})`);
+}
+export async function apiRunUpdate(runId, payload) {
+  const res = await fetch(`${API}/api/runs/update`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ run_id: runId, ...payload }),
+  });
+  return readJsonResponse(res, `run update failed (${res.status})`);
+}
+export async function apiRunCancel(runId) {
+  const res = await fetch(`${API}/api/runs/cancel`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ run_id: runId }),
+  });
+  return readJsonResponse(res, `run cancel failed (${res.status})`);
+}
+export async function apiRunRetry(runId) {
+  const res = await fetch(`${API}/api/runs/retry`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ run_id: runId }),
+  });
+  return readJsonResponse(res, `run retry failed (${res.status})`);
 }
 
 // ── Supabase: persisted chats, memory matrix, work-done log ──────────────
@@ -236,6 +274,32 @@ export async function apiProjectReadDoc(projectId, name) {
   }
   return res.text();
 }
+export async function apiProjectDeleteDoc(projectId, name) {
+  const res = await fetch(`${API}/api/projects/docs/delete`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project_id: projectId, name, approved: true }),
+  });
+  return readJsonResponse(res, `document delete failed (${res.status})`);
+}
+export async function apiProjectRenameDoc(projectId, name, newName) {
+  const res = await fetch(`${API}/api/projects/docs/rename`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project_id: projectId, name, new_name: newName }),
+  });
+  return readJsonResponse(res, `document rename failed (${res.status})`);
+}
+export async function apiProjectIndex(projectId) {
+  const res = await fetch(`${API}/api/projects/index`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project_id: projectId }),
+  });
+  return readJsonResponse(res, `project index failed (${res.status})`);
+}
+export async function apiProjectContext(projectId) {
+  const res = await fetch(`${API}/api/projects/context?project_id=${encodeURIComponent(projectId)}`, { cache: 'no-store' });
+  return readJsonResponse(res, `project context failed (${res.status})`);
+}
+export async function apiProjectSearch(projectId, query) {
+  const res = await fetch(`${API}/api/projects/search?project_id=${encodeURIComponent(projectId)}&q=${encodeURIComponent(query)}`, { cache: 'no-store' });
+  return readJsonResponse(res, `project search failed (${res.status})`);
+}
 export async function apiProjectPublishGithub(payload) {
   const res = await fetch(`${API}/api/projects/github/publish`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -315,7 +379,29 @@ export const CONNECTOR_DEFS = [
   // (does the chat loop send `tools=` to the model at all?), handled as a
   // special case in renderCapabilityBar below.
   { id: 'agent_tools', label: 'Agent tools', icon: '🔧', toggle: true },
+  { id: 'auto_approve', label: 'Auto-approve', icon: '🛡', toggle: true },
 ];
+
+// Approval policy. Every write/edit/shell tool call is gated by the backend
+// (TOOL_APPROVAL_SCOPES). Confirming each one individually makes multi-step
+// work unusable, so scopes can be granted for the session — the grant lives
+// in memory only and dies with the tab, never persisted to disk.
+const sessionApprovedScopes = new Set();
+const AUTO_APPROVE_KEY = 'qh-auto-approve-v1';
+
+export function getAutoApprove() {
+  return localStorage.getItem(AUTO_APPROVE_KEY) === 'true';
+}
+export function setAutoApprove(on) {
+  localStorage.setItem(AUTO_APPROVE_KEY, String(on));
+  if (!on) sessionApprovedScopes.clear();
+}
+export function isScopeApproved(scope) {
+  return getAutoApprove() || sessionApprovedScopes.has(scope);
+}
+export function approveScopeForSession(scope) {
+  sessionApprovedScopes.add(scope);
+}
 
 export function getToolsEnabled() {
   const raw = localStorage.getItem(TOOLS_ENABLED_KEY);
@@ -428,14 +514,18 @@ export function renderCapabilityBar(container, opts) {
     btn.className = 'cap-btn';
 
     if (def.toggle) {
-      // A runtime mode switch (e.g. "agent_tools"), not a drawer-opener —
-      // reflects its own on/off state rather than the connectors list.
-      const on = getToolsEnabled();
+      // A runtime mode switch (agent_tools / auto_approve), not a
+      // drawer-opener — reflects its own on/off state.
+      const read = def.id === 'auto_approve' ? getAutoApprove : getToolsEnabled;
+      const write = def.id === 'auto_approve' ? setAutoApprove : setToolsEnabled;
+      const on = read();
       btn.classList.toggle('is-on', on);
-      btn.title = `${def.label}: ${on ? 'on' : 'off'} — click to toggle`;
+      btn.title = def.id === 'auto_approve'
+        ? `Auto-approve file writes and shell commands for this session: ${on ? 'on' : 'off'}`
+        : `${def.label}: ${on ? 'on' : 'off'} — click to toggle`;
       btn.innerHTML = `<span class="cap-icon">${def.icon}</span><span>${def.label}: ${on ? 'On' : 'Off'}</span>`;
       btn.addEventListener('click', () => {
-        setToolsEnabled(!getToolsEnabled());
+        write(!read());
         renderCapabilityBar(container, opts);
       });
       container.append(btn);

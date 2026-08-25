@@ -176,6 +176,30 @@ file/GitHub/web control:
   locate code before editing instead of guessing paths.
 - **`append_file`** — append to a file (now registered; previously dead code).
 
+**Approvals.** Write/edit/shell/computer tools are gated server-side
+(`TOOL_APPROVAL_SCOPES` in `gui/server.py`). By default each new scope asks
+once via a confirm dialog; approving grants that scope for the rest of the
+browser session. The **🛡 Auto-approve** capability-bar toggle skips the
+prompt entirely — useful for long autonomous coding runs, off by default.
+Grants are in-memory per tab and never written to disk.
+
+**Small-model compatibility.** Many local models emit a tool call as plain
+text (`{"type":"function","function":{...}}`) instead of the structured
+`tool_calls` field — llama3.2 does this consistently. `gui/agent-loop.js`
+salvages those back into real calls (handles `<tool_call>` tags, fenced JSON,
+and the `arguments`/`parameters`/`_parameters` key variants), so these models
+actually work instead of printing JSON at you.
+
+**Prompt budget.** Sending all 35 tool schemas costs ~3k tokens per request —
+enough to stall a 4B model on an 8GB CPU-only Mac. Each surface sends only a
+relevant profile (`TOOL_PROFILES` in `gui/agent-loop.js`): ~1.4k tokens for
+the code profile. `tool_search` is always included so agents can still reach
+anything not in their profile.
+
+**Path safety.** `tools/policy.py`'s `require_path()` resolves every
+agent-supplied path against the agent's working directory, refuses paths
+outside granted roots, and blocks secret files (`.env`, `*.pem`, `*.key`).
+
 When the GUI chat loop runs with tools on, the system prompt automatically
 teaches this workflow (read → edit_file → verify; search before guessing) and
 tells the model its working directory (active project path, selected

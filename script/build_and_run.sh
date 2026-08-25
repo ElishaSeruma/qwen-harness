@@ -8,6 +8,7 @@ APP_DIR="$ROOT/dist/$APP_NAME.app"
 BUNDLE_ID="local.qwen-harness.desktop"
 LOGO_PNG="$ROOT/AppLogo.png"
 MODE="${1:-run}"
+CONFIG="release"
 
 case "$MODE" in
   run|--debug|debug|--logs|logs|--telemetry|telemetry|--verify|verify) ;;
@@ -16,14 +17,18 @@ esac
 
 cd "$ROOT"
 
+if [[ "$MODE" == "--debug" || "$MODE" == "debug" ]]; then
+  CONFIG="debug"
+fi
+
 if pgrep -x "$PRODUCT" >/dev/null 2>&1; then
   pkill -x "$PRODUCT" || true
 fi
 pkill -f "gui/server.py" >/dev/null 2>&1 || true
 
-swift build -c debug
+swift build -c "$CONFIG"
 
-BIN="$(swift build -c debug --show-bin-path)/$PRODUCT"
+BIN="$(swift build -c "$CONFIG" --show-bin-path)/$PRODUCT"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN" "$APP_DIR/Contents/MacOS/$PRODUCT"
@@ -71,9 +76,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>1.0.0</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>$(date -u +%Y%m%d%H%M)</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
@@ -82,14 +87,22 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <string>NSApplication</string>
   <key>NSAppTransportSecurity</key>
   <dict>
-    <key>NSAllowsArbitraryLoads</key>
-    <true/>
     <key>NSAllowsLocalNetworking</key>
     <true/>
   </dict>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Qwen Harness accesses project folders you explicitly choose.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Qwen Harness accesses project documents you explicitly choose.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Qwen Harness imports files you explicitly choose.</string>
 </dict>
 </plist>
 PLIST
+
+plutil -lint "$APP_DIR/Contents/Info.plist" >/dev/null
+codesign --force --deep --sign - "$APP_DIR" >/dev/null
+codesign --verify --deep --strict "$APP_DIR"
 
 open_app() {
   /usr/bin/open -n "$APP_DIR"

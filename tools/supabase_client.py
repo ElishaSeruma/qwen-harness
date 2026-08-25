@@ -14,12 +14,12 @@ Connect with:
 
 from __future__ import annotations
 import json
-import os
-import stat
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+from tools.policy import atomic_write_json
 
 SECRETS_PATH = Path.home() / ".qwen-harness" / "secrets.json"
 EMBEDDING_MODEL = "nomic-embed-text"
@@ -37,9 +37,7 @@ def _load_secrets() -> dict:
 
 
 def _save_secrets(data: dict) -> None:
-    SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SECRETS_PATH.write_text(json.dumps(data, indent=2))
-    os.chmod(SECRETS_PATH, stat.S_IRUSR | stat.S_IWUSR)
+    atomic_write_json(SECRETS_PATH, data)
 
 
 def _creds() -> tuple[str, str] | None:
@@ -244,3 +242,43 @@ def sb_get_latest_compaction(chat_id: str) -> dict:
         "chat_id": f"eq.{chat_id}", "select": "*", "order": "created_at.desc", "limit": "1",
     })
     return {"status": "ok", "compaction": (result or [None])[0]}
+
+
+# ── durable orchestration snapshots ─────────────────────────────────────
+
+def sb_sync_run(run: dict, project: dict | None = None) -> dict:
+    """Mirror a local run snapshot. Local storage remains authoritative offline."""
+    if project:
+        project_row = {
+            "id": project["id"], "name": project.get("name") or project["id"],
+            "working_directory": project.get("path") or run.get("cwd") or "",
+            "repository": project.get("repo") or {}, "settings": project.get("settings") or {},
+        }
+        _request("projects", method="POST", body=project_row, params={"on_conflict": "id"}, prefer="resolution=merge-duplicates")
+
+    status = run.get("status") or "queued"
+    if status in {"thinking", "working"}:
+        status = "running"
+    row = {
+        "id": run["id"], "project_id": run.get("project_id") if project else None,
+        "parent_run_id": run.get("parent_run_id"), "surface": run.get("surface") or "home",
+        "instruction": run.get("instruction") or "", "status": status,
+        "cwd": run.get("cwd"), "model_key": run.get("model_key"),
+        "agent_ids": run.get("agent_ids") or [], "attempt": run.get("attempt") or 1,
+        "effort_level": run.get("effort_level") or 1, "effort_source": run.get("effort_source") or "auto",
+        "effort_reason": run.get("effort_reason"),
+        "result": run.get("result"), "error": run.get("error"),
+        "created_at": run.get("created_at"), "completed_at": run.get("completed_at"),
+        "updated_at": run.get("updated_at"),
+    }
+    _request("agent_runs", method="POST", body=row, params={"on_conflict": "id"}, prefer="resolution=merge-duplicates")
+    for task in run.get("tasks") or []:
+        task_key = str(task.get("id") or task.get("task_key") or "task")
+        task_row = {
+            "run_id": run["id"], "task_key": task_key,
+            "title": task.get("title") or task.get("instruction") or task_key,
+            "status": task.get("status") or "pending", "agent_id": task.get("agent_id"),
+            "depends_on": task.get("depends_on") or [], "result": task.get("result"), "error": task.get("error"),
+        }
+        _request("run_tasks", method="POST", body=task_row, params={"on_conflict": "run_id,task_key"}, prefer="resolution=merge-duplicates")
+    return {"status": "ok", "run_id": run["id"]}

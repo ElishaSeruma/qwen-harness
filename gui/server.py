@@ -51,9 +51,9 @@ static frontend cannot do on its own:
   GET  /api/memory/search?q=<query>          -> semantic (falls back to keyword) memory search
   POST /api/work-done {agent_id, action_type, file_path, ...} -> log a file CRUD action
 
-This is intentionally unauthenticated and unsandboxed: it's a personal,
-single-user, local dev tool — it binds to 127.0.0.1 only and is not meant
-to be exposed beyond your own machine.
+This is a single-user local service bound to 127.0.0.1. Filesystem access is
+limited to persisted user grants, secrets are blocked from agent tools, and
+state-changing tool calls require an explicit approval context.
 """
 import json
 import os
@@ -62,6 +62,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,6 +71,8 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))  # so `tools.*` importable, matching the Python agents
+from tools.policy import atomic_write_json, is_secret_path
+
 MAX_READ_BYTES = 3 * 1024 * 1024  # 3MB cap so the browser doesn't choke
 EXEC_TIMEOUT_S = 30
 STATE_DIR = Path.home() / '.qwen-harness'
@@ -83,6 +86,32 @@ SKIP_DIR_NAMES = {'.git', 'node_modules', '__pycache__', '.DS_Store'}
 # terminal and the Python agent's run_shell tool refuse the same things.
 # This is a basic guard, not a sandbox — see module docstring.
 DANGEROUS_PATTERNS = ["sudo", "rm -rf", "mkfs", ":(){:|:&};:"]
+
+TOOL_APPROVAL_SCOPES = {
+    'write_file': 'write files',
+    'edit_file': 'edit files',
+    'append_file': 'append to files',
+    'run_shell': 'execute a shell command',
+    'click': 'control the computer',
+    'double_click': 'control the computer',
+    'type_text': 'control the computer',
+    'press_key': 'control the computer',
+    'scroll': 'control the computer',
+    'browser_navigate': 'navigate the automated browser',
+    'browser_click': 'interact with the automated browser',
+    'browser_type': 'interact with the automated browser',
+    'browser_evaluate': 'execute code in the automated browser',
+    'fetch_data': 'access a network API',
+    'web_search': 'search the web',
+    'scrape_url': 'read a web page',
+    'memory_write': 'write persistent memory',
+    'memory_forget': 'delete persistent memory',
+    'create_display': 'open a generated display',
+}
+TOOL_CWD_NAMES = {
+    'read_file', 'write_file', 'append_file', 'list_dir', 'run_shell',
+    'edit_file', 'search_files', 'find_files',
+}
 
 CONTENT_TYPES = {
     '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -158,8 +187,7 @@ class Handler(BaseHTTPRequestHandler):
         return sorted(set(valid))
 
     def _save_grants(self, roots):
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        PERMISSIONS_PATH.write_text(json.dumps({'roots': sorted(set(roots))}, indent=2), encoding='utf-8')
+        atomic_write_json(PERMISSIONS_PATH, {'roots': sorted(set(roots))})
 
     def _is_granted(self, path):
         try:
@@ -203,8 +231,7 @@ class Handler(BaseHTTPRequestHandler):
         return []
 
     def _save_projects(self, projects):
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        PROJECTS_PATH.write_text(json.dumps({'projects': projects}, indent=2), encoding='utf-8')
+        atomic_write_json(PROJECTS_PATH, {'projects': projects})
 
     def _find_project(self, project_id):
         for project in self._load_projects():
@@ -322,10 +349,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_projects()
         if parsed.path == '/api/projects/docs/read':
             return self._handle_project_doc_read(parse_qs(parsed.query))
+        if parsed.path == '/api/projects/context':
+            return self._handle_project_context(parse_qs(parsed.query))
+        if parsed.path == '/api/projects/search':
+            return self._handle_project_search(parse_qs(parsed.query))
         if parsed.path == '/api/tools/list':
             return self._handle_tools_list()
         if parsed.path == '/api/system/stats':
             return self._handle_system_stats()
+        if parsed.path == '/api/runs':
+            return self._handle_runs_list(parsed)
+        if parsed.path == '/api/runs/events':
+            return self._handle_run_events(parsed)
+        if parsed.path == '/api/runs/stream':
+            return self._handle_run_stream(parsed)
+        if parsed.path.startswith('/api/runs/'):
+            return self._handle_run_get(parsed.path.rsplit('/', 1)[-1])
         if parsed.path == '/api/supabase/status':
             return self._handle_supabase_status()
         if parsed.path == '/api/chats':
@@ -362,6 +401,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_project_create()
         if parsed.path == '/api/projects/docs/add':
             return self._handle_project_docs_add()
+        if parsed.path == '/api/projects/docs/delete':
+            return self._handle_project_doc_delete()
+        if parsed.path == '/api/projects/docs/rename':
+            return self._handle_project_doc_rename()
+        if parsed.path == '/api/projects/index':
+            return self._handle_project_index()
         if parsed.path == '/api/projects/github/publish':
             return self._handle_project_github_publish()
         if parsed.path == '/api/projects/delete':
@@ -372,6 +417,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_project_git_action()
         if parsed.path == '/api/tools/call':
             return self._handle_tools_call()
+        if parsed.path == '/api/runs/create':
+            return self._handle_run_create()
+        if parsed.path == '/api/runs/event':
+            return self._handle_run_event()
+        if parsed.path == '/api/runs/update':
+            return self._handle_run_update()
+        if parsed.path == '/api/runs/cancel':
+            return self._handle_run_cancel()
+        if parsed.path == '/api/runs/retry':
+            return self._handle_run_retry()
         if parsed.path == '/api/supabase/connect':
             return self._handle_supabase_connect()
         if parsed.path == '/api/supabase/disconnect':
@@ -421,6 +476,7 @@ class Handler(BaseHTTPRequestHandler):
     # ── filesystem API ──────────────────────────────────────────────────
     def _handle_list(self, query):
         raw = query.get('path', [''])[0]
+        show_secrets = query.get('show_secrets', ['0'])[0] == '1'
         path = self._resolve_path(raw)
         denied = self._require_grant(path)
         if denied:
@@ -431,6 +487,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             for child in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
                 if child.name in SKIP_DIR_NAMES:
+                    continue
+                if not show_secrets and is_secret_path(child):
                     continue
                 try:
                     is_dir = child.is_dir()
@@ -677,11 +735,155 @@ class Handler(BaseHTTPRequestHandler):
         from tools import execute_tool
         body = self._read_json_body()
         name = body.get('name')
-        args = body.get('args') or {}
+        args = dict(body.get('args') or {})
+        context = body.get('context') or {}
         if not name:
             return self._send_json({'error': 'missing tool name'}, 400)
+
+        approval_scope = TOOL_APPROVAL_SCOPES.get(name)
+        if approval_scope and context.get('approved') is not True:
+            return self._send_json({
+                'error': f'approval required to {approval_scope}',
+                'approval_required': True,
+                'scope': approval_scope,
+                'tool': name,
+                'args': args,
+            }, 409)
+
+        if name in TOOL_CWD_NAMES:
+            cwd = self._resolve_path(context.get('cwd') or REPO_ROOT)
+            if self._require_grant(cwd):
+                return
+            args['cwd'] = str(cwd)
+
+        if name in {'read_file', 'write_file', 'append_file', 'edit_file'} and args.get('path'):
+            raw = Path(str(args['path'])).expanduser()
+            target = (Path(args.get('cwd') or REPO_ROOT) / raw).resolve() if not raw.is_absolute() else raw.resolve()
+            if is_secret_path(target) and context.get('allow_secret') is not True:
+                return self._send_json({
+                    'error': f'secret-file access blocked for {target}',
+                    'permission_required': True,
+                    'secret': True,
+                    'path': str(target),
+                }, 403)
+
         result = execute_tool(name, args)
-        self._send_json({'result': result})
+        status = 403 if isinstance(result, dict) and result.get('permission_required') else 200
+        self._send_json({'result': result}, status)
+
+    # ── Durable runs and live events ────────────────────────────────────
+    def _handle_runs_list(self, parsed):
+        from gui.run_store import RUN_STORE
+        query = parse_qs(parsed.query)
+        project_id = query.get('project_id', [None])[0]
+        try:
+            limit = int(query.get('limit', ['50'])[0])
+        except ValueError:
+            limit = 50
+        self._send_json({'runs': RUN_STORE.list(project_id=project_id, limit=limit)})
+
+    def _handle_run_get(self, run_id):
+        from gui.run_store import RUN_STORE
+        run = RUN_STORE.get(run_id)
+        self._send_json({'run': run} if run else {'error': 'run not found'}, 200 if run else 404)
+
+    def _sync_run_background(self, run):
+        if not run:
+            return
+        project = self._find_project(run.get('project_id')) if run.get('project_id') else None
+        def sync():
+            try:
+                from tools.supabase_client import sb_status, sb_sync_run
+                if sb_status().get('connected'):
+                    sb_sync_run(run, project)
+            except Exception as exc:
+                sys.stderr.write(f'[gui-server] Supabase run sync skipped: {exc}\n')
+        threading.Thread(target=sync, name=f'run-sync-{run.get("id", "unknown")[:8]}', daemon=True).start()
+
+    def _handle_run_create(self):
+        from gui.run_store import RUN_STORE
+        body = self._read_json_body()
+        if not str(body.get('instruction') or '').strip():
+            return self._send_json({'error': 'instruction is required'}, 400)
+        cwd = self._resolve_path(body.get('cwd') or REPO_ROOT)
+        if self._require_grant(cwd):
+            return
+        body['cwd'] = str(cwd)
+        run = RUN_STORE.create(body)
+        self._sync_run_background(run)
+        self._send_json({'run': run}, 201)
+
+    def _handle_run_event(self):
+        from gui.run_store import RUN_STORE
+        body = self._read_json_body()
+        event = RUN_STORE.append_event(body.get('run_id'), body.get('type') or 'run.event', body.get('data') or {})
+        self._send_json({'event': event} if event else {'error': 'run not found'}, 200 if event else 404)
+
+    def _handle_run_update(self):
+        from gui.run_store import RUN_STORE
+        body = self._read_json_body()
+        run = RUN_STORE.update(body.get('run_id'), body)
+        self._sync_run_background(run)
+        self._send_json({'run': run} if run else {'error': 'run not found'}, 200 if run else 404)
+
+    def _handle_run_cancel(self):
+        from gui.run_store import RUN_STORE
+        body = self._read_json_body()
+        run = RUN_STORE.cancel(body.get('run_id'))
+        self._sync_run_background(run)
+        self._send_json({'run': run} if run else {'error': 'run not found'}, 200 if run else 404)
+
+    def _handle_run_retry(self):
+        from gui.run_store import RUN_STORE
+        body = self._read_json_body()
+        run = RUN_STORE.retry(body.get('run_id'))
+        self._sync_run_background(run)
+        self._send_json({'run': run} if run else {'error': 'run not found'}, 201 if run else 404)
+
+    def _handle_run_events(self, parsed):
+        from gui.run_store import RUN_STORE
+        query = parse_qs(parsed.query)
+        run_id = query.get('run_id', [''])[0]
+        try:
+            after = int(query.get('after', ['0'])[0])
+        except ValueError:
+            after = 0
+        if not RUN_STORE.get(run_id):
+            return self._send_json({'error': 'run not found'}, 404)
+        self._send_json({'events': RUN_STORE.events_after(run_id, after)})
+
+    def _handle_run_stream(self, parsed):
+        from gui.run_store import RUN_STORE
+        query = parse_qs(parsed.query)
+        run_id = query.get('run_id', [''])[0]
+        if not RUN_STORE.get(run_id):
+            return self._send_json({'error': 'run not found'}, 404)
+        try:
+            seq = int(self.headers.get('Last-Event-ID') or query.get('after', ['0'])[0])
+        except ValueError:
+            seq = 0
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.end_headers()
+        try:
+            for _ in range(8):
+                events = RUN_STORE.wait_for_events(run_id, seq, timeout=3.0)
+                if not events:
+                    self.wfile.write(b': keepalive\n\n')
+                    self.wfile.flush()
+                    continue
+                for event in events:
+                    seq = int(event['seq'])
+                    payload = json.dumps(event, separators=(',', ':')).encode('utf-8')
+                    self.wfile.write(f'id: {seq}\nevent: run-event\ndata: '.encode('utf-8') + payload + b'\n\n')
+                    self.wfile.flush()
+                run = RUN_STORE.get(run_id)
+                if run and run.get('status') in {'completed', 'failed', 'cancelled', 'interrupted'}:
+                    break
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     # ── Resource monitor ─────────────────────────────────────────────────
     # "Tasks" = currently-loaded Ollama models (GET /api/ps, Ollama's native
@@ -1036,6 +1238,125 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({'error': f'document not found: {name}'}, 404)
         self._send_text(path.read_text(encoding='utf-8', errors='replace'))
 
+    def _handle_project_doc_delete(self):
+        body = self._read_json_body()
+        project = self._find_project(body.get('project_id'))
+        if not project:
+            return self._send_json({'error': 'project not found'}, 404)
+        if body.get('approved') is not True:
+            return self._send_json({'error': 'deleting a context document requires approval', 'approval_required': True}, 409)
+        name = self._safe_doc_name(body.get('name') or '')
+        docs_dir = self._project_docs_dir(project).resolve()
+        path = (docs_dir / name).resolve()
+        try:
+            path.relative_to(docs_dir)
+        except ValueError:
+            return self._send_json({'error': 'invalid document path'}, 400)
+        if self._require_grant(Path(project['path']).resolve()):
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            return self._send_json({'error': str(error)}, 400)
+        project['documents'] = [doc for doc in project.get('documents', []) if doc.get('name') != name]
+        self._upsert_project(project)
+        self._send_json({'ok': True, 'project': project})
+
+    def _handle_project_doc_rename(self):
+        body = self._read_json_body()
+        project = self._find_project(body.get('project_id'))
+        if not project:
+            return self._send_json({'error': 'project not found'}, 404)
+        old_name = self._safe_doc_name(body.get('name') or '')
+        new_name = self._safe_doc_name(body.get('new_name') or '')
+        docs_dir = self._project_docs_dir(project).resolve()
+        source, target = (docs_dir / old_name).resolve(), (docs_dir / new_name).resolve()
+        if self._require_grant(Path(project['path']).resolve()):
+            return
+        if not source.exists():
+            return self._send_json({'error': 'document not found'}, 404)
+        if target.exists() and target != source:
+            return self._send_json({'error': f'document already exists: {new_name}'}, 409)
+        source.rename(target)
+        for doc in project.get('documents', []):
+            if doc.get('name') == old_name:
+                doc.update({'name': new_name, 'path': str(target)})
+        project['documents'] = sorted(project.get('documents', []), key=lambda doc: doc['name'].lower())
+        self._upsert_project(project)
+        self._send_json({'ok': True, 'project': project, 'name': new_name})
+
+    def _handle_project_index(self):
+        body = self._read_json_body()
+        project = self._find_project(body.get('project_id'))
+        if not project:
+            return self._send_json({'error': 'project not found'}, 404)
+        root = Path(project['path']).resolve()
+        if self._require_grant(root):
+            return
+        allowed_suffixes = {'.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.swift', '.md', '.json', '.toml', '.yaml', '.yml', '.sh', '.css', '.html', '.sql'}
+        symbol_pattern = re.compile(r'^\s*(?:def|class|function|func|struct|enum|interface|type|const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)', re.MULTILINE)
+        files, symbols, total_bytes = [], [], 0
+        for path in root.rglob('*'):
+            if len(files) >= 4000:
+                break
+            if not path.is_file() or path.suffix.lower() not in allowed_suffixes:
+                continue
+            if any(part in SKIP_DIR_NAMES or part in {'.build', 'dist', '.qwen-harness'} for part in path.relative_to(root).parts):
+                continue
+            if is_secret_path(path):
+                continue
+            try:
+                stat = path.stat()
+                if stat.st_size > 1024 * 1024:
+                    continue
+                text = path.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            relative = str(path.relative_to(root))
+            found = symbol_pattern.findall(text)[:80]
+            files.append({'path': relative, 'bytes': stat.st_size, 'mtime': stat.st_mtime, 'symbols': found})
+            symbols.extend({'name': name, 'path': relative} for name in found)
+            total_bytes += stat.st_size
+        index = {'version': 1, 'created_at': time.time(), 'root': str(root), 'file_count': len(files), 'symbol_count': len(symbols), 'total_bytes': total_bytes, 'files': files, 'symbols': symbols[:12000]}
+        index_path = root / '.qwen-harness' / 'index.json'
+        atomic_write_json(index_path, index)
+        project['index'] = {key: index[key] for key in ('created_at', 'file_count', 'symbol_count', 'total_bytes')}
+        self._upsert_project(project)
+        self._send_json({'ok': True, 'project': project, 'index': project['index']})
+
+    def _load_project_index(self, project):
+        path = Path(project['path']) / '.qwen-harness' / 'index.json'
+        try:
+            return json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return None
+
+    def _handle_project_context(self, query):
+        project = self._find_project(query.get('project_id', [''])[0])
+        if not project:
+            return self._send_json({'error': 'project not found'}, 404)
+        index = self._load_project_index(project)
+        self._send_json({'project_id': project['id'], 'documents': project.get('documents', []), 'index': ({key: index.get(key) for key in ('created_at', 'file_count', 'symbol_count', 'total_bytes')} if index else None), 'settings': project.get('settings', {})})
+
+    def _handle_project_search(self, query):
+        project = self._find_project(query.get('project_id', [''])[0])
+        term = query.get('q', [''])[0].strip().lower()
+        if not project:
+            return self._send_json({'error': 'project not found'}, 404)
+        if not term:
+            return self._send_json({'error': 'missing q'}, 400)
+        index = self._load_project_index(project)
+        if not index:
+            return self._send_json({'error': 'project has not been indexed'}, 409)
+        results = []
+        for file in index.get('files', []):
+            haystack = f"{file.get('path', '')} {' '.join(file.get('symbols', []))}".lower()
+            if term in haystack:
+                results.append({'path': file.get('path'), 'symbols': [name for name in file.get('symbols', []) if term in name.lower()]})
+            if len(results) >= 50:
+                break
+        self._send_json({'query': term, 'results': results})
+
     def _handle_project_github_publish(self):
         from tools.github import gh_create_repo, gh_token_for_git
 
@@ -1205,7 +1526,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({'ok': True, 'project_id': project_id, 'removed_files': remove_files})
 
     def _handle_project_git_action(self):
-        from tools.github import gh_create_repo
+        from tools.github import (
+            gh_create_issue, gh_create_pull_request, gh_create_repo,
+            gh_dispatch_workflow, gh_list_workflows,
+        )
 
         body = self._read_json_body()
         project = self._find_project(body.get('project_id'))
@@ -1228,6 +1552,14 @@ class Handler(BaseHTTPRequestHandler):
         branch_result = self._run_git(['branch', '--show-current'], project_dir)
         branch = (branch_result.get('stdout') or '').strip() or 'main'
 
+        def github_repo_parts():
+            full_name = ((project.get('repo') or {}).get('github') or {}).get('full_name')
+            if full_name and '/' in full_name:
+                return full_name.split('/', 1)
+            current_remote = remote or self._run_git(['remote', 'get-url', 'origin'], project_dir).get('stdout', '').strip()
+            match = re.search(r'github\.com[/:]([^/]+)/([^/]+?)(?:\.git)?$', current_remote)
+            return match.groups() if match else (None, None)
+
         def require_approval(label):
             if body.get('approved') is not True:
                 self._send_json({'error': f'{label} requires explicit approval', 'approval_required': True}, 400)
@@ -1238,6 +1570,16 @@ class Handler(BaseHTTPRequestHandler):
         updated_project = project
         if action == 'status':
             result = self._run_git(['status', '--short', '--branch'], project_dir)
+        elif action == 'diff':
+            result = self._run_git(['diff', '--stat', '--patch', '--no-ext-diff'], project_dir)
+        elif action == 'stage':
+            if not require_approval('staging all changes'):
+                return
+            result = self._run_git(['add', '--all'], project_dir)
+        elif action == 'unstage':
+            if not require_approval('unstaging changes'):
+                return
+            result = self._run_git(['reset', '--mixed', 'HEAD'], project_dir)
         elif action == 'log':
             result = self._run_git(['log', '--oneline', '--decorate', '-n', str(int(body.get('limit') or 12))], project_dir)
         elif action == 'branches':
@@ -1305,6 +1647,75 @@ class Handler(BaseHTTPRequestHandler):
             if not re.match(r'^[A-Za-z0-9._/-]+$', name):
                 return self._send_json({'error': 'invalid branch name'}, 400)
             result = self._run_git(['merge', name], project_dir)
+        elif action == 'worktrees':
+            result = self._run_git(['worktree', 'list', '--porcelain'], project_dir)
+        elif action == 'worktree_create':
+            if not require_approval('worktree creation'):
+                return
+            name = (body.get('branch') or '').strip()
+            if not re.match(r'^[A-Za-z0-9._/-]+$', name):
+                return self._send_json({'error': 'invalid branch name'}, 400)
+            target = Path(body.get('path') or (project_dir.parent / f'{project_dir.name}-{self._slugify(name)}')).expanduser().resolve()
+            if self._require_grant(target.parent):
+                return
+            if target.exists():
+                return self._send_json({'error': f'worktree path already exists: {target}'}, 409)
+            args = ['worktree', 'add']
+            if body.get('create') is not False:
+                args.extend(['-b', name])
+            args.extend([str(target), name] if body.get('create') is False else [str(target)])
+            result = self._run_git(args, project_dir)
+        elif action == 'worktree_remove':
+            if not require_approval('worktree removal'):
+                return
+            target = Path(body.get('path') or '').expanduser().resolve()
+            if not body.get('path') or target == project_dir:
+                return self._send_json({'error': 'select a linked worktree, not the primary project'}, 400)
+            if self._require_grant(target):
+                return
+            listed = self._run_git(['worktree', 'list', '--porcelain'], project_dir).get('stdout', '')
+            if f'worktree {target}' not in listed:
+                return self._send_json({'error': 'path is not a linked worktree'}, 400)
+            result = self._run_git(['worktree', 'remove', str(target)], project_dir)
+        elif action == 'pr_create':
+            if not require_approval('pull request creation'):
+                return
+            owner, repo_name = github_repo_parts()
+            if not owner:
+                return self._send_json({'error': 'project has no GitHub remote'}, 400)
+            response = gh_create_pull_request(owner, repo_name, (body.get('title') or '').strip(), body.get('head') or branch, body.get('base') or 'main', body.get('body') or '')
+            if 'error' in response:
+                return self._send_json(response, 400)
+            return self._send_json({'ok': True, 'project': updated_project, 'github': response})
+        elif action == 'issue_create':
+            if not require_approval('issue creation'):
+                return
+            owner, repo_name = github_repo_parts()
+            if not owner:
+                return self._send_json({'error': 'project has no GitHub remote'}, 400)
+            response = gh_create_issue(owner, repo_name, (body.get('title') or '').strip(), body.get('body') or '')
+            if 'error' in response:
+                return self._send_json(response, 400)
+            return self._send_json({'ok': True, 'project': updated_project, 'github': response})
+        elif action == 'workflows':
+            owner, repo_name = github_repo_parts()
+            if not owner:
+                return self._send_json({'error': 'project has no GitHub remote'}, 400)
+            response = gh_list_workflows(owner, repo_name)
+            if 'error' in response:
+                return self._send_json(response, 400)
+            return self._send_json({'ok': True, 'project': updated_project, 'github': response})
+        elif action == 'workflow_dispatch':
+            if not require_approval('workflow dispatch'):
+                return
+            owner, repo_name = github_repo_parts()
+            workflow = str(body.get('workflow') or '').strip()
+            if not owner or not workflow:
+                return self._send_json({'error': 'GitHub remote and workflow are required'}, 400)
+            response = gh_dispatch_workflow(owner, repo_name, workflow, body.get('ref') or branch, body.get('inputs') if isinstance(body.get('inputs'), dict) else {})
+            if 'error' in response:
+                return self._send_json(response, 400)
+            return self._send_json({'ok': True, 'project': updated_project, 'github': response})
         else:
             return self._send_json({'error': f'unsupported git action: {action}'}, 400)
 
