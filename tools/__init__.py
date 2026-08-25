@@ -336,7 +336,15 @@ TOOL_DEFINITIONS: list[dict] = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web and return the top results (title, url, snippet).",
+            "description": (
+                "Search the live internet and return the top results (title, url, "
+                "snippet). Call this whenever the user asks you to search, google, "
+                "look something up, go online, or find information about a person, "
+                "company, product, event, price, or news item — and whenever you are "
+                "not certain of a fact. You have real internet access through this "
+                "tool: never reply that you cannot browse the web. Follow up with "
+                "scrape_url on a result to read the full page."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -351,7 +359,11 @@ TOOL_DEFINITIONS: list[dict] = [
         "type": "function",
         "function": {
             "name": "scrape_url",
-            "description": "Fetch a URL and return its readable text content (HTML stripped).",
+            "description": (
+                "Fetch a URL and return its readable text content (HTML stripped). "
+                "Use this to read a page in full — typically on a url returned by "
+                "web_search, or any link the user gives you."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

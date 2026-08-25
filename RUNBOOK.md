@@ -133,12 +133,56 @@ composer (Home, Code chat, Agent Hub console):
   composer you last focused. Agents can also call `web_search` / `scrape_url`
   directly.
 
+### Why a chat model sometimes answered instead of searching
+
+Asking "search the web for X" in a chat composer used to get a text reply
+rather than a `web_search` call. Three causes, all fixed:
+
+1. `inferEffort()` scored a short prompt as Quick (1/4), and Quick appended
+   *"Avoid unnecessary planning or tool calls"* to the system prompt — the
+   harness telling the model not to do what was just asked. `wantsToolUse()`
+   in `gui/effort.js` now detects an explicit tool/web request and floors the
+   level at Focus (2/4), and at Quick the anti-tool line is swapped for one
+   that still permits the call.
+2. The "Tool usage guidance" block in `gui/agent-loop.js` only covered file
+   and code tools. It now states when to reach for `web_search` /
+   `scrape_url`, and that the model does have internet access through them.
+3. The `code` and `minimal` tool profiles omit the web tools to keep the
+   prompt small, so on the Code surface there was no `web_search` to call.
+   They're now spliced back in for any turn whose prompt is plainly about
+   the internet.
+
+If a model still won't call a tool, check in order: the "Agent tools"
+capability toggle is on; the model reports the `tools` capability
+(`curl -s localhost:11434/api/tags | grep -A2 capabilities`); and the tool is
+in the surface's profile in `TOOL_PROFILES`.
+
 To disconnect GitHub or check status from a terminal instead:
 
 ```bash
 curl -s http://127.0.0.1:8420/api/github/status
 curl -s -X POST http://127.0.0.1:8420/api/github/disconnect
 ```
+
+## 8b. The Tools button (topbar)
+
+`Tools NN` in the topbar opens a drawer listing every entry in
+`TOOL_DEFINITIONS` as **Friendly name → `tool_id`** (Web search →
+`web_search`, Read file → `read_file`), grouped by area, with a filter box.
+Click a row to copy the tool id.
+
+Two things it tells you that are otherwise invisible:
+
+- **Surface badges** on each row — which of the `TOOL_PROFILES` in
+  `gui/agent-loop.js` actually offer that tool. A tool with no badge is
+  reachable only via `tool_search`, and a tool missing from your current
+  surface simply won't be offered to the model on that screen.
+- **The status line at the top** — warns when the "Agent tools" toggle is off
+  or when the active model has no tool-calling support, the two conditions
+  that stop every tool from working regardless of what the list shows.
+
+The friendly names are derived from the tool ids, so tools added to
+`TOOL_DEFINITIONS` appear here without touching `gui/tools-panel.js`.
 
 ## 9. Tools available to agents (Python side)
 

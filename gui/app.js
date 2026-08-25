@@ -5,8 +5,9 @@
 // console for scripted demo runs / direct live chat with one agent.
 
 import { renderFileTree, withPaths } from './filetree.js';
-import { runAgentTurn } from './agent-loop.js';
+import { invalidateSkillDefs, runAgentTurn } from './agent-loop.js';
 import { createActivityIndicator } from './activity.js';
+import { mountToolsDrawer } from './tools-panel.js';
 import { createMessageActions, renderMarkdown } from './message-renderer.js';
 import { beginRun, cancelRun, emitRunEvent, failRun, finishRun, listRuns, updateRun } from './runs.js';
 import { createTaskPlan, executeTaskGraph } from './orchestration.js';
@@ -23,6 +24,7 @@ import {
   apiProjects, apiProjectCreate, apiProjectAddDocs, apiProjectReadDoc, apiProjectDeleteDoc, apiProjectRenameDoc,
   apiProjectIndex, apiProjectSearch, apiProjectPublishGithub, apiProjectGitAction, apiProjectDelete, apiProjectSettings,
   apiWebSearch, apiWebScrape, apiGithubStatus, apiGithubConnect, apiGithubDisconnect, apiGithubRepos,
+  apiSkillCreate, apiSkillsList, apiToolsList,
   apiSupabaseStatus, apiSupabaseConnect, apiSupabaseDisconnect,
   isDesktopClient, desktopChooseDirectory, desktopChooseFile,
   getDirectory, setDirectory, getHotphrases, setHotphrases,
@@ -374,6 +376,7 @@ function setActivityDrawer(open) {
   $('#activity-toggle').setAttribute('aria-expanded', String(open));
   if (open) renderActivityDrawer();
 }
+mountToolsDrawer({ getModelKey: () => modelsConfig.active });
 $('#activity-toggle').addEventListener('click', () => setActivityDrawer($('#activity-drawer').hidden));
 $('#activity-close').addEventListener('click', () => setActivityDrawer(false));
 // Run events stream in fast during inference; without a trailing debounce the
@@ -528,6 +531,7 @@ function currentSurface() {
   if (!$('#view-projects').hidden) return 'project';
   if (!$('#view-code').hidden) return 'code';
   if (!$('#view-hub').hidden) return 'hub';
+  if (!$('#view-skills').hidden) return 'skills';
   return 'home';
 }
 
@@ -3206,17 +3210,103 @@ const savedTheme = localStorage.getItem(THEME_KEY) || (matchMedia('(prefers-colo
 applyTheme(savedTheme);
 $('#theme-toggle').addEventListener('click', () => applyTheme(document.documentElement.classList.contains('dark') ? 'light' : 'dark'));
 
-const ROUTE_TITLES = { home: 'Home', code: 'Code', projects: 'Projects', hub: 'Agent hub' };
+const ROUTE_TITLES = { home: 'Home', code: 'Code', projects: 'Projects', hub: 'Agent hub', skills: 'Skills & Tools' };
+let catalogLoaded = false;
+function catalogRow(title, detail, meta = '') {
+  const row = document.createElement('article'); row.className = 'catalog-row';
+  const head = document.createElement('h3'); head.textContent = title;
+  const copy = document.createElement('p'); copy.textContent = detail;
+  row.append(head, copy);
+  if (meta) { const note = document.createElement('small'); note.textContent = meta; row.append(note); }
+  return row;
+}
+async function renderSkillsAndTools() {
+  if (catalogLoaded) return;
+  const skillsEl = $('#skills-catalog'); const toolsEl = $('#tools-catalog');
+  skillsEl.replaceChildren(); toolsEl.replaceChildren();
+  try {
+    const [{ skills }, { tools }] = await Promise.all([apiSkillsList(), apiToolsList()]);
+    for (const skill of skills) {
+      skillsEl.append(catalogRow(`${skill.description} → ${skill.name} (${skill.command})`, `Source: ${skill.source}. ${skill.safety}`, skill.tools?.length ? `Tools: ${skill.tools.join(', ')}` : 'No required tools'));
+    }
+    for (const tool of tools) {
+      const fn = tool.function || {};
+      const friendly = String(fn.name || 'unknown tool').split('_').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
+      toolsEl.append(catalogRow(`${friendly} → ${fn.name || 'unknown_tool'}`, fn.description || 'Available agent action'));
+    }
+    if (!skills.length) skillsEl.append(catalogRow('No installed skills', 'Add a SKILL.md folder under skills/.'));
+    catalogLoaded = true;
+  } catch (error) {
+    skillsEl.append(catalogRow('Catalog unavailable', error.message));
+  }
+}
+function setCatalogTab(tab) {
+  const skills = tab === 'skills';
+  $('#skills-catalog').hidden = !skills; $('#tools-catalog').hidden = skills;
+  $('#catalog-skills-tab').classList.toggle('is-active', skills); $('#catalog-tools-tab').classList.toggle('is-active', !skills);
+  $('#catalog-skills-tab').setAttribute('aria-selected', String(skills)); $('#catalog-tools-tab').setAttribute('aria-selected', String(!skills));
+}
+$('#catalog-skills-tab').addEventListener('click', () => setCatalogTab('skills'));
+$('#catalog-tools-tab').addEventListener('click', () => setCatalogTab('tools'));
+function parseSkillMarkdown(source) {
+  const text = String(source || '').replace(/^\uFEFF/, '').trim();
+  const match = /^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/m.exec(text);
+  const fields = {};
+  if (match) {
+    for (const line of match[1].split('\n')) {
+      const separator = line.indexOf(':');
+      if (separator < 0) continue;
+      const key = line.slice(0, separator).trim();
+      const value = line.slice(separator + 1).trim().replace(/^(?:"|')|(?:"|')$/g, '');
+      fields[key] = value;
+    }
+  }
+  return { fields, instructions: (match ? match[2] : text).trim() };
+}
+$('#add-skill-markdown').addEventListener('change', async (event) => {
+  const input = event.currentTarget; const file = input.files?.[0]; const status = $('#add-skill-status');
+  if (!file) return;
+  if (!/\.md$/i.test(file.name) || file.size > 1024 * 1024) {
+    input.value = ''; status.textContent = 'Choose a Markdown (.md) file smaller than 1 MB.'; return;
+  }
+  try {
+    const { fields, instructions } = parseSkillMarkdown(await file.text());
+    const form = $('#add-skill-form');
+    if (fields.name) form.elements.name.value = String(fields.name).replace(/^\//, '').trim();
+    if (fields.description) form.elements.description.value = fields.description;
+    if (fields.tools) form.elements.tools.value = fields.tools;
+    if (instructions) form.elements.instructions.value = instructions;
+    status.textContent = instructions ? `Loaded ${file.name}. Review the fields, then install.` : `No Markdown instructions found in ${file.name}.`;
+  } catch (error) { status.textContent = `Couldn't read ${file.name}: ${error.message}`; }
+});
+$('#add-skill-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget; const status = $('#add-skill-status');
+  const values = new FormData(form);
+  status.textContent = 'Installing…';
+  try {
+    const result = await apiSkillCreate({
+      name: String(values.get('name') || '').replace(/^\//, '').trim(),
+      description: values.get('description'), instructions: values.get('instructions'),
+      tools: String(values.get('tools') || '').split(',').map(tool => tool.trim()).filter(Boolean),
+    });
+    form.reset(); $('#add-skill-panel').open = false;
+    status.textContent = `${result.skill.command} installed.`;
+    catalogLoaded = false; invalidateSkillDefs(); await renderSkillsAndTools(); setCatalogTab('skills');
+  } catch (error) { status.textContent = error.message; }
+});
 function switchRoute(route) {
   document.querySelectorAll('.rail-link').forEach(link => link.classList.toggle('is-active', link.dataset.route === route));
   $('#view-home').hidden = route !== 'home';
   $('#view-code').hidden = route !== 'code';
   $('#view-projects').hidden = route !== 'projects';
   $('#view-hub').hidden = route !== 'hub';
+  $('#view-skills').hidden = route !== 'skills';
   $('#route-title').textContent = ROUTE_TITLES[route];
   localStorage.setItem(ROUTE_KEY, route);
   if (route === 'projects') refreshProjects();
   if (route === 'hub') renderHub();
+  if (route === 'skills') renderSkillsAndTools();
 }
 document.querySelectorAll('.rail-link').forEach(link => link.addEventListener('click', () => switchRoute(link.dataset.route)));
 
@@ -3256,6 +3346,25 @@ const SERVICES_LABELS = {
   failed: 'Services failed',
 };
 
+function renderServiceModels(models, activeModel) {
+  const list = $('#services-models');
+  list.replaceChildren();
+  for (const m of models) {
+    const li = document.createElement('li');
+    li.dataset.state = m.state;
+    const dot = document.createElement('span');
+    dot.className = 'status-dot'; dot.setAttribute('aria-hidden', 'true');
+    const name = document.createElement('span');
+    name.className = 'sm-name';
+    name.textContent = m.name === activeModel ? `${m.name} ★` : m.name;
+    const detail = document.createElement('span');
+    detail.className = 'sm-detail';
+    detail.textContent = m.detail || m.state;
+    li.append(dot, name, detail);
+    list.append(li);
+  }
+}
+
 function renderServices(status) {
   const btn = $('#services-toggle');
   const state = status?.state || 'idle';
@@ -3273,6 +3382,8 @@ function renderServices(status) {
   else if (state === 'done') step.textContent = status.active_model ? `Ready · ACTIVE_MODEL ${status.active_model}` : 'Ready.';
   else if (state === 'failed') step.textContent = status.error || 'Failed.';
   else step.textContent = 'Not started.';
+
+  renderServiceModels(status?.models || [], status?.active_model);
 
   const log = $('#services-log');
   if (status?.log?.length) {
