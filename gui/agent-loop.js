@@ -98,12 +98,27 @@ const TOOL_PROFILES = {
     'read_file', 'write_file', 'edit_file', 'list_dir', 'search_files',
     'run_shell', 'web_search', 'scrape_url', 'memory_write', 'memory_search', 'tool_search',
   ],
+  // Sub-2B models are the ones fast enough to be useful for agentic work on
+  // this hardware, but they degrade badly with a long tool list. Five tools
+  // (~450 tokens vs ~1400) covers read/edit/locate/run; tool_search reaches
+  // the rest on demand.
+  minimal: [
+    'read_file', 'edit_file', 'search_files', 'run_shell', 'tool_search',
+  ],
 };
 
 function selectTools(allTools, profile) {
-  if (profile === 'all' || !TOOL_PROFILES[profile]) return allTools;
-  const wanted = new Set(TOOL_PROFILES[profile]);
-  const picked = allTools.filter(t => wanted.has(t.function?.name));
+  if (profile === 'all') return allTools;
+  const wanted = TOOL_PROFILES[profile];
+  if (!wanted) {
+    // Falling back to all ~35 schemas here would silently reintroduce the
+    // ~3k-token prompt this whole mechanism exists to avoid, and a typo'd
+    // profile name would be invisible. Fail loudly, degrade to minimal.
+    console.warn(`[agent-loop] unknown tool profile "${profile}" — using minimal`);
+    return selectTools(allTools, 'minimal');
+  }
+  const set = new Set(wanted);
+  const picked = allTools.filter(t => set.has(t.function?.name));
   return picked.length ? picked : allTools;
 }
 
@@ -118,12 +133,37 @@ async function loadModelInfo() {
       .then(r => r.json())
       .then(data => new Map((data.models || []).map(m => [
         m.name,
-        { capabilities: m.capabilities || [], contextLength: m.details?.context_length ?? null },
+        {
+          capabilities: m.capabilities || [],
+          contextLength: m.details?.context_length ?? null,
+          paramBillions: parseParamBillions(m.details?.parameter_size),
+        },
       ])))
       .catch(() => new Map());
   }
   return modelInfoPromise;
 }
+/**
+ * Ollama reports parameter_size as a string with MIXED units — "4.0B",
+ * "1.2B", but also "751.63M" and "999.89M". A naive parseFloat would read
+ * qwen3:0.6b ("751.63M") as a 751-billion-parameter model, i.e. exactly
+ * backwards. Normalize to billions; return null when unknown.
+ */
+function parseParamBillions(raw) {
+  if (typeof raw !== 'string') return null;
+  const m = raw.trim().match(/^([\d.]+)\s*([BbMm])?$/);
+  if (!m) return null;
+  const value = parseFloat(m[1]);
+  if (!Number.isFinite(value)) return null;
+  return (m[2] || 'B').toUpperCase() === 'M' ? value / 1000 : value;
+}
+
+/** Parameter count in billions, or null if Ollama didn't report it. */
+async function modelParamBillions(modelKey) {
+  const info = await loadModelInfo();
+  return info.get(modelKey)?.paramBillions ?? null;
+}
+
 async function modelSupportsTools(modelKey) {
   const info = await loadModelInfo();
   return (info.get(modelKey)?.capabilities || []).includes('tools');
@@ -193,7 +233,15 @@ export async function runAgentTurn({ modelKey, systemPrompt, userText, priorMess
     onEvent?.({ type: 'system', text: `${modelKey} doesn't support tool-calling — replying without tools.` });
   }
   const allTools = canUseTools ? await loadToolDefs().catch(() => null) : null;
-  let tools = allTools ? selectTools(allTools, toolProfile) : null;
+  // Downgrade to the minimal profile for small models regardless of which
+  // surface asked. Unknown size falls back to the REQUESTED profile, never to
+  // minimal — an unrecognised model shouldn't lose capability.
+  let effectiveProfile = toolProfile;
+  if (allTools && toolProfile !== 'all') {
+    const billions = await modelParamBillions(modelKey);
+    if (billions != null && billions < 2) effectiveProfile = 'minimal';
+  }
+  let tools = allTools ? selectTools(allTools, effectiveProfile) : null;
   if (tools && activeEffort >= 2 && activeEffort <= 3) tools = [...tools, EFFORT_ESCALATION_TOOL];
 
   // When tools are live, teach the model how to code well with them —
