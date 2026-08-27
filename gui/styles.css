@@ -87,8 +87,14 @@ html, body { height: 100%; }
 body { margin: 0; background: var(--background); color: var(--foreground); font-family: var(--font-sans); }
 
 .view[hidden] { display: none !important; }
+/* Default: a view scrolls inside the shell rather than growing the page. */
+.view { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 24px; }
 
-.app { display: flex; min-height: 100vh; }
+/* The page itself must never scroll. Previously .app grew with the transcript,
+   so sending a second prompt meant scrolling back up to a composer that had
+   drifted off-screen. Now the viewport is fixed and each view scrolls inside
+   itself, which is what keeps the composer docked. */
+.app { display: flex; height: 100vh; overflow: hidden; }
 
 /* ── rail ─────────────────────────────────────────────────────────────── */
 .rail {
@@ -117,8 +123,9 @@ body { margin: 0; background: var(--background); color: var(--foreground); font-
 }
 
 /* ── shell / topbar ───────────────────────────────────────────────────── */
-.shell { flex: 1; min-width: 0; padding: 20px 24px 40px; display: flex; flex-direction: column; }
+.shell { flex: 1; min-width: 0; min-height: 0; padding: 20px 24px 0; display: flex; flex-direction: column; overflow: hidden; }
 .topbar {
+  flex: none;
   display: flex; align-items: center; justify-content: space-between; gap: 20px;
   margin-bottom: 20px; padding-bottom: 16px; border-bottom: 3px solid var(--border);
 }
@@ -382,7 +389,11 @@ input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px s
 .attachment-chip button { border: none; background: transparent; color: inherit; cursor: pointer; font-weight: 800; }
 
 /* ── HOME ─────────────────────────────────────────────────────────────── */
-.home-view { flex: 1; display: flex; flex-direction: column; max-width: 900px; margin: 0 auto; width: 100%; }
+.home-view { flex: 1; min-height: 0; display: flex; flex-direction: column; max-width: 900px; margin: 0 auto; width: 100%; overflow: hidden; padding-bottom: 0; }
+.home-greeting, .resource-monitor, .composer-shell { flex: none; }
+/* Once a conversation starts the greeting gives its space to the transcript. */
+.home-view[data-chat="active"] .home-greeting { display: none; }
+.home-view[data-chat="active"] .home-feed { border-width: 2px; }
 .home-greeting { margin: 4vh 0 20px; }
 .home-greeting-inner { display: flex; align-items: center; justify-content: center; gap: 20px; }
 .home-greeting-copy { text-align: left; }
@@ -460,7 +471,11 @@ input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px s
 @media (prefers-reduced-motion: reduce) { .effort-gauge * { animation: none !important; } }
 .composer > .effort-gauge { flex: none; align-self: stretch; height: auto; min-height: 42px; }
 
-.home-feed { margin-top: 20px; border: 2px solid var(--border); background: var(--muted); padding: 12px; display: flex; flex-direction: column; gap: 8px; min-height: 160px; flex: 1; overflow-y: auto; }
+.home-feed { margin: 0 0 16px; border: 2px solid var(--border); background: var(--muted); padding: 12px; display: flex; flex-direction: column; gap: 8px; min-height: 0; flex: 1; overflow-y: auto; overscroll-behavior: contain; }
+/* Anchors the transcript to the bottom while it grows, so streaming text stays
+   in view without a scrollTop write on every token. */
+@supports (overflow-anchor: auto) { .home-feed > * { overflow-anchor: none; } }
+.feed-scroll-anchor { flex: none; height: 1px; overflow-anchor: auto; }
 .chat-entry-wrap { display: flex; flex-direction: column; gap: 4px; }
 .chat-agent-badge { display: inline-flex; align-items: center; gap: 7px; max-width: max-content; padding: 3px 6px; border: 1px solid var(--border); background: var(--card); color: var(--card-foreground); }
 .chat-agent-avatar { width: 22px; height: 22px; flex: none; overflow: hidden; border: 1px solid var(--border); background: var(--muted); }
@@ -528,7 +543,7 @@ input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px s
 .project-control-room { display: flex; flex-direction: column; gap: 12px; margin-bottom: 14px; }
 .project-resource-monitor { margin-bottom: 0; }
 .project-composer-shell { box-shadow: none; }
-.project-main-feed { margin-top: 0; max-height: 260px; flex: none; }
+.project-main-feed { margin: 0 0 12px; min-height: 180px; max-height: 42vh; flex: 1; }
 .project-create-form { display: flex; flex-direction: column; gap: 10px; }
 .inline-field-row { display: flex; gap: 8px; }
 .inline-field-row input { flex: 1; min-width: 0; }

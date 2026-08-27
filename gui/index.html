@@ -108,6 +108,10 @@
         </div>
       </div>
 
+      <div class="home-feed" id="home-feed">
+        <p class="transcript-empty">Responses from the agent(s) you message will appear here.</p>
+      </div>
+
       <div class="composer-shell" id="home-composer-shell">
         <div class="capability-bar" id="home-capbar"></div>
         <textarea id="home-composer-input" class="composer-textarea" rows="3" placeholder="Type an instruction…"></textarea>
@@ -125,10 +129,6 @@
           </label>
           <button id="home-send" type="button" class="send-button">Send →</button>
         </div>
-      </div>
-
-      <div class="home-feed" id="home-feed">
-        <p class="transcript-empty">Responses from the agent(s) you message will appear here.</p>
       </div>
 
     </main>
@@ -289,6 +289,9 @@
               <span class="resource-idle">No active inference</span>
             </div>
           </div>
+          <div class="home-feed project-main-feed" id="project-main-feed">
+            <p class="transcript-empty">Project-scoped agent responses appear here.</p>
+          </div>
           <div class="composer-shell project-composer-shell">
             <div class="capability-bar" id="project-capbar"></div>
             <textarea id="project-composer-input" class="composer-textarea" rows="3" placeholder="Type a project instruction..."></textarea>
@@ -303,9 +306,6 @@
               </label>
               <button id="project-send" type="button" class="send-button" disabled>Send</button>
             </div>
-          </div>
-          <div class="home-feed project-main-feed" id="project-main-feed">
-            <p class="transcript-empty">Project-scoped agent responses appear here.</p>
           </div>
         </section>
 
