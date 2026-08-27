@@ -15,10 +15,15 @@ import urllib.request
 import urllib.error
 from html.parser import HTMLParser
 
+from tools.platform_support import IS_MAC, IS_WINDOWS
+
+# Claiming to be a Mac from a Windows machine is a needless inconsistency with
+# the client hints the request carries; state the real platform.
 USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 "
-    "qwen-harness/1.0"
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " if IS_MAC else
+     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " if IS_WINDOWS else
+     "Mozilla/5.0 (X11; Linux x86_64) ")
+    + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 qwen-harness/1.0"
 )
 REQUEST_TIMEOUT = 15
 MAX_SCRAPE_CHARS = 8000

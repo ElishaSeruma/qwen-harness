@@ -3,3 +3,9 @@ playwright>=1.44.0
 pyautogui>=0.9.54
 Pillow>=10.0.0
 rich>=13.0.0
+
+# Windows has no system IANA timezone database, so the stdlib `zoneinfo`
+# reads it from this package instead. Without it every ZoneInfo() lookup
+# raises and tools/datetime_tool.py — which is in EVERY tool profile,
+# including `minimal` — fails on every call. Not optional on Windows.
+tzdata>=2024.1; sys_platform == "win32"

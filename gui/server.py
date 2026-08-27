@@ -83,6 +83,19 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))  # so `tools.*` importable, matching the Python agents
+from tools.platform_support import (
+    IS_WINDOWS,
+    PLATFORM_NAME,
+    blocked_pattern,
+    dangerous_patterns,
+    detached_kwargs,
+    extra_path_dirs,
+    find_binary,
+    quiet_kwargs,
+    repair_path as platform_repair_path,
+    shell_argv_for_terminal,
+    shell_kind,
+)
 from tools.policy import (
     atomic_write_json,
     granted_roots as policy_granted_roots,
@@ -90,6 +103,7 @@ from tools.policy import (
     is_granted as policy_is_granted,
     is_secret_path,
 )
+from tools.sysinfo import system_snapshot, total_memory_mb
 
 MAX_READ_BYTES = 3 * 1024 * 1024  # 3MB cap so the browser doesn't choke
 EXEC_TIMEOUT_S = 30
@@ -99,23 +113,19 @@ PROJECTS_PATH = STATE_DIR / 'projects.json'
 PROJECTS_LOCK = threading.RLock()
 
 
-def _total_memory_mb():
-    """Physical RAM in MB. A machine constant — read once, not per request."""
-    try:
-        out = subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True, timeout=5).stdout.strip()
-        return round(int(out) / (1024 * 1024), 1)
-    except Exception:
-        return None
-
-
-TOTAL_MEMORY_MB = _total_memory_mb()
+# Physical RAM in MB. A machine constant — read once, not per request.
+# `sysctl` is macOS-only; tools/sysinfo.py picks the right source per platform.
+TOTAL_MEMORY_MB = total_memory_mb()
 
 SKIP_DIR_NAMES = {'.git', 'node_modules', '__pycache__', '.DS_Store'}
 
 # Same substring blocklist as tools/files.py's run_shell, so the browser
 # terminal and the Python agent's run_shell tool refuse the same things.
+# Now sourced from one place, and platform-aware: the POSIX patterns never
+# match the Windows command that does the same damage, so a Windows user was
+# previously running with no guard at all.
 # This is a basic guard, not a sandbox — see module docstring.
-DANGEROUS_PATTERNS = ["sudo", "rm -rf", "mkfs", ":(){:|:&};:"]
+DANGEROUS_PATTERNS = list(dangerous_patterns())
 
 TOOL_APPROVAL_SCOPES = {
     'write_file': 'write files',
@@ -165,7 +175,16 @@ CONTENT_TYPES = {
 SERVICES_LOCK = threading.RLock()
 SERVICES_LOG_LINES = 400   # ring buffer; the GUI only ever shows a tail
 SERVICES_STEPS = ('ollama', 'models', 'config.py')
-OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://localhost:11434').rstrip('/')
+# Ollama binds 127.0.0.1 only, and on Windows `localhost` resolves to ::1
+# first. Measured on this machine: a urllib request to
+# http://localhost:11434/api/tags takes 2133 ms because the ::1 connection has
+# to fail before the IPv4 fallback is tried; the same request to
+# http://127.0.0.1:11434/api/tags takes 8 ms. A 266x penalty, paid on EVERY
+# inference call and on every 3-second poll of the resource monitor.
+#
+# So the address is the literal IPv4 everywhere, not a hostname. OLLAMA_HOST
+# still overrides it for anyone pointing at a remote Ollama.
+OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434').rstrip('/')
 if not OLLAMA_HOST.startswith('http'):
     OLLAMA_HOST = f'http://{OLLAMA_HOST}'
 OLLAMA_BOOT_TIMEOUT_S = 30
@@ -221,42 +240,29 @@ def _ollama_tags():
         return None
 
 
-# A GUI app launched from Finder or the Dock inherits a bare PATH —
-# /usr/bin:/bin:/usr/sbin:/sbin — not your shell's. Homebrew lives in
-# /opt/homebrew/bin, so `shutil.which('ollama')` fails even with ollama
-# installed, and "Start services" reports it as missing. The same blindness
-# hits git, npm, node and every test command the sandbox runs, so this is
-# repaired once, globally, at startup.
-EXTRA_PATH_DIRS = (
-    '/opt/homebrew/bin', '/opt/homebrew/sbin',      # Apple Silicon Homebrew
-    '/usr/local/bin', '/usr/local/sbin',            # Intel Homebrew, manual installs
-    str(Path.home() / '.local' / 'bin'),
-    str(Path.home() / '.ollama' / 'bin'),
-    '/Applications/Ollama.app/Contents/Resources',  # the Ollama.app bundle
-)
+# A GUI app does not inherit your shell's PATH on either platform. macOS hands
+# a Finder-launched app a bare /usr/bin:/bin:/usr/sbin:/sbin, so Homebrew's
+# /opt/homebrew/bin is invisible and "Start services" reports ollama as
+# missing on a machine where it works fine in Terminal. Windows is the same
+# story with a different cast: Ollama installs per-user under
+# %LOCALAPPDATA%\Programs\Ollama, which a shortcut-launched process often
+# cannot see. The same blindness hits git, node, npm and every test command
+# the sandbox runs, so it is repaired once, globally, at startup.
+#
+# The per-platform directory list and the lookup both live in
+# tools/platform_support.py; these names stay for the tests and for any
+# caller that imported them.
+EXTRA_PATH_DIRS = extra_path_dirs()
 
 
 def repair_path() -> str:
     """Put the usual binary locations back on PATH. Returns the new PATH."""
-    current = os.environ.get('PATH', '')
-    parts = [p for p in current.split(os.pathsep) if p]
-    for extra in EXTRA_PATH_DIRS:
-        if extra not in parts and os.path.isdir(extra):
-            parts.append(extra)
-    os.environ['PATH'] = os.pathsep.join(parts)
-    return os.environ['PATH']
+    return platform_repair_path()
 
 
 def find_ollama() -> str | None:
     """Absolute path to the ollama binary, PATH or not."""
-    found = shutil.which('ollama')
-    if found:
-        return found
-    for directory in EXTRA_PATH_DIRS:
-        candidate = os.path.join(directory, 'ollama')
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
+    return find_binary('ollama')
 
 
 def _services_start_ollama():
@@ -266,7 +272,9 @@ def _services_start_ollama():
         return 'running'
     binary = find_ollama()
     if not binary:
-        _services_log('! ollama binary not found — install it first (brew install ollama)')
+        install_hint = ('download it from https://ollama.com/download/windows'
+                        if IS_WINDOWS else 'brew install ollama')
+        _services_log(f'! ollama binary not found — install it first ({install_hint})')
         _services_log(f'  searched PATH ({os.environ.get("PATH", "")}) and the usual install locations')
         return 'unavailable'
     _services_log(f'Ollama not responding — starting `{binary} serve`…')
@@ -290,7 +298,11 @@ def _services_start_ollama():
             # resolving it here means this works even if that ever regresses.
             [binary, 'serve'], env=serve_env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL, start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            # start_new_session is POSIX-only; on Windows the equivalent is
+            # DETACHED_PROCESS, plus CREATE_NO_WINDOW so a console does not
+            # flash up in front of the desktop app.
+            **detached_kwargs(),
         )
     except OSError as exc:
         _services_log(f'! could not start ollama: {exc}')
@@ -316,7 +328,7 @@ def _local_roster():
         '}))'
     )
     proc = subprocess.run([sys.executable, '-c', script], cwd=str(REPO_ROOT),
-                          capture_output=True, text=True, timeout=30)
+                          capture_output=True, text=True, timeout=30, **quiet_kwargs())
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or 'config.py failed').strip().splitlines()[-1])
     return json.loads(proc.stdout.strip().splitlines()[-1])
@@ -467,9 +479,17 @@ class Handler(BaseHTTPRequestHandler):
         # relative to the repo root and "not a directory" errors follow.
         while len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ('"', "'"):
             cleaned = cleaned[1:-1].strip()
-        cleaned = cleaned.replace('\\ ', ' ')
+        if not IS_WINDOWS:
+            # Backslash-unescaping is POSIX-only and actively wrong on
+            # Windows, where the backslash is the path separator: it would
+            # turn C:\Users\ Public into C:\Users Public.
+            cleaned = cleaned.replace('\\ ', ' ')
         if cleaned.startswith('file://'):
             cleaned = unquote(cleaned[len('file://'):]) or '/'
+            # A Windows file URL is file:///C:/... — the leading slash in
+            # front of the drive letter has to go or the path is invalid.
+            if IS_WINDOWS and re.match(r'^/[A-Za-z]:', cleaned):
+                cleaned = cleaned[1:]
         if not cleaned:
             return REPO_ROOT
         return Path(cleaned).expanduser().resolve()
@@ -637,6 +657,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == '/api/health':
             return self._send_json({'ok': True})
+        if parsed.path == '/api/platform':
+            return self._handle_platform()
         if parsed.path == '/api/fs/list':
             return self._handle_list(parse_qs(parsed.query))
         if parsed.path == '/api/fs/read':
@@ -1005,9 +1027,9 @@ class Handler(BaseHTTPRequestHandler):
         cwd = body.get('cwd') or str(REPO_ROOT)
         if not command:
             return self._send_json({'error': 'missing command'}, 400)
-        for pattern in DANGEROUS_PATTERNS:
-            if pattern in command:
-                return self._send_json({'ok': False, 'error': f"blocked dangerous command pattern: '{pattern}'"}, 400)
+        blocked = blocked_pattern(command)
+        if blocked:
+            return self._send_json({'ok': False, 'error': f"blocked dangerous command pattern: '{blocked}'"}, 400)
         cwd_path = self._resolve_path(cwd)
         denied = self._require_grant(cwd_path)
         if denied:
@@ -1019,12 +1041,19 @@ class Handler(BaseHTTPRequestHandler):
         # script, joined by a newline), then split the real output from the
         # reported cwd on a marker line, and hand that cwd back to the
         # frontend to use as `cwd` on the next call.
+        #
+        # The Windows form is not a translation of the sh one: `%CD%` inside a
+        # cmd one-liner is expanded at PARSE time, so a `cd` earlier on the
+        # same line is invisible to it and the terminal would silently never
+        # move. shell_argv_for_terminal() emits PowerShell (which reports
+        # (Get-Location).ProviderPath after the fact) or cmd with delayed
+        # expansion, per QH_SHELL.
         cwd_marker = '@@QH_CWD@@'
-        script = f'{command}\nprintf \'\\n{cwd_marker}%s\' "$PWD"'
         try:
             proc = subprocess.run(
-                script, shell=True, cwd=str(cwd_path),
+                shell_argv_for_terminal(command, cwd_marker), cwd=str(cwd_path),
                 capture_output=True, text=True, timeout=EXEC_TIMEOUT_S,
+                **quiet_kwargs(),
             )
             stdout = proc.stdout
             new_cwd = str(cwd_path)
@@ -1133,6 +1162,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if name in SANDBOX_TOOLS:
             args['run_id'] = context.get('run_id') or ''
+            # Without this, sandbox_status/verify/promote would always act on
+            # the run's default tree while the writes went to the agent's.
+            args['agent_id'] = context.get('agent_id') or ''
 
         if name in {'read_file', 'write_file', 'append_file', 'edit_file'} and args.get('path'):
             raw = Path(str(args['path'])).expanduser()
@@ -1177,8 +1209,15 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
         project_root = Path(args.get('cwd') or REPO_ROOT)
+        agent_id = context.get('agent_id')
         try:
-            sandbox = get_sandbox(run_id, project_root)
+            sandbox = get_sandbox(run_id, project_root, agent_id=agent_id)
+            # The boundary comes from the on-disk roster, never from the
+            # request. A client-supplied boundary would be one an agent could
+            # widen per call, which is not a boundary.
+            if agent_id and not sandbox.file_boundary:
+                from tools.agents_store import contract_for
+                sandbox.file_boundary = tuple(contract_for(agent_id).get('fileBoundary') or ())
             if name == 'run_shell':
                 out = sandbox.run(args.get('command', ''), timeout=int(args.get('timeout') or 120))
                 return {**out, 'sandboxed': True}
@@ -1440,6 +1479,33 @@ class Handler(BaseHTTPRequestHandler):
         snap['models'] = [dict(m) for m in SERVICES_STATE['models']]
         return snap
 
+    def _handle_platform(self):
+        """What OS this is, and what that changes.
+
+        The frontend needs this for more than cosmetics. A path placeholder
+        reading "/Users/you/some/project" on Windows is not a small wrongness:
+        it is the example a user copies, and it cannot resolve. The shell name
+        matters too — the terminal surface accepts PowerShell here and sh on a
+        Mac, and telling the user which is a one-line saving over discovering
+        it from an error.
+        """
+        from tools.sandbox import confinement
+        home = str(Path.home())
+        return self._send_json({
+            'ok': True,
+            'platform': PLATFORM_NAME,
+            'is_windows': IS_WINDOWS,
+            'shell': shell_kind(),
+            'path_separator': os.sep,
+            'home': home,
+            'repo_root': str(REPO_ROOT),
+            'state_dir': str(STATE_DIR),
+            'example_project_path': str(Path(home) / 'Projects' / 'my-app'),
+            'example_parent_dir': str(Path(home) / 'Projects'),
+            'confinement': confinement(),
+            'total_memory_mb': TOTAL_MEMORY_MB,
+        })
+
     def _handle_services_status(self):
         with SERVICES_LOCK:
             self._send_json({'ok': True, **self._services_snapshot()})
@@ -1449,42 +1515,22 @@ class Handler(BaseHTTPRequestHandler):
 
         loaded = []
         try:
-            req = urllib.request.Request('http://localhost:11434/api/ps')
+            req = urllib.request.Request(f'{OLLAMA_HOST}/api/ps')
             with urllib.request.urlopen(req, timeout=5) as resp:
                 loaded = json.loads(resp.read()).get('models', [])
         except Exception:
             pass
 
-        # One `ps` sweep (~0.05s) yields BOTH the per-llama-server rows and the
-        # machine-wide CPU total. This replaces the old `top -l 1` call, which
-        # measured 25.8s on an 8GB Mac under load — polled every 3s, it starved
-        # the very inference it was monitoring.
-        procs = []
-        total_cpu = None
-        try:
-            out = subprocess.run(
-                ['ps', '-axo', 'pid,pcpu,rss,comm'],
-                capture_output=True, text=True, timeout=5,
-            ).stdout
-            cpu_sum = 0.0
-            for line in out.splitlines()[1:]:
-                parts = line.split(None, 3)
-                if len(parts) < 4:
-                    continue
-                pid, pcpu, rss, comm = parts
-                try:
-                    cpu_sum += float(pcpu)
-                except ValueError:
-                    continue
-                if 'llama-server' in comm:
-                    procs.append({'pid': int(pid), 'cpu_pct': float(pcpu), 'mem_mb': round(int(rss) / 1024, 1)})
-            # ps %cpu is a per-process lifetime average, not an instantaneous
-            # sample, so this lags real utilization — but it is the same metric
-            # already shown per-task, so the numbers stay internally consistent.
-            cores = os.cpu_count() or 1
-            total_cpu = round(min(100.0, cpu_sum / cores), 1)
-        except Exception:
-            pass
+        # One cheap sweep yields BOTH the per-runner rows and the machine-wide
+        # totals. On macOS that is a single `ps` (~0.05s), replacing the old
+        # `top -l 1` call which measured 25.8s under load — polled every 3s, it
+        # starved the very inference it was monitoring. On Windows it is
+        # GlobalMemoryStatusEx + GetSystemTimes through ctypes plus one
+        # `tasklist`, for the same reason: this endpoint must never cost more
+        # than the thing it is watching.
+        snapshot = system_snapshot(TOTAL_MEMORY_MB)
+        procs = snapshot['processes']
+        system = snapshot['system']
 
         tasks = []
         for i, model in enumerate(loaded):
@@ -1497,36 +1543,6 @@ class Handler(BaseHTTPRequestHandler):
                 'cpu_pct': proc['cpu_pct'] if proc else None,
                 'mem_mb': proc['mem_mb'] if proc else None,
             })
-
-        # Load average is the honest saturation signal (ps %cpu is a lifetime
-        # average and understates bursts), so ship it alongside rather than
-        # instead of cpu_pct — 0.01s, and it's what exposed the pile-up.
-        load_avg = None
-        try:
-            raw = subprocess.run(['sysctl', '-n', 'vm.loadavg'], capture_output=True, text=True, timeout=2).stdout
-            load_avg = round(float(raw.strip().strip('{}').split()[0]), 2)
-        except Exception:
-            pass
-
-        system = {
-            'cpu_pct': total_cpu,
-            'mem_used_mb': None,
-            'mem_total_mb': TOTAL_MEMORY_MB,
-            'load_avg': load_avg,
-            'cpu_count': os.cpu_count(),
-        }
-        try:
-            vm = subprocess.run(['vm_stat'], capture_output=True, text=True, timeout=5).stdout
-            page_size_m = re.search(r'page size of (\d+) bytes', vm)
-            page_size = int(page_size_m.group(1)) if page_size_m else 4096
-            used_pages = 0
-            for label in ('Pages active', 'Pages wired down', 'Pages occupied by compressor'):
-                m = re.search(rf'{label}:\s+(\d+)', vm)
-                if m:
-                    used_pages += int(m.group(1))
-            system['mem_used_mb'] = round(used_pages * page_size / (1024 * 1024), 1)
-        except Exception:
-            pass
 
         self._send_json({'system': system, 'tasks': tasks})
 
@@ -2348,6 +2364,7 @@ def main():
     print(f"(ollama: {ollama_binary or 'NOT FOUND'})")
     if not ollama_binary:
         sys.stderr.write(f"[gui-server] ollama not found on PATH={repaired}\n")
+    print(f"(platform: {PLATFORM_NAME}; terminal shell: {shell_kind()})")
     try:
         # Sandboxes from runs that never finished would otherwise accumulate
         # under ~/.qwen-harness/sandboxes forever.

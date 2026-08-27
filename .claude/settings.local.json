@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(foreach \\($c in 'python','python3','py','ollama','dotnet','node','npm','git','gh','pwsh','swift'\\) { $p = \\(Get-Command $c -ErrorAction SilentlyContinue\\); if \\($p\\) { \"{0} -> {1}\" -f $c, $p.Source } else { \"$c -> MISSING\" } }; \"---\"; $env:PATH)",
+      "PowerShell(dotnet --list-sdks; \"---\"; ollama list; \"---\"; \\(Get-CimInstance Win32_ComputerSystem\\).TotalPhysicalMemory/1GB; \"---\"; python --version; python -c \"import openai\" 2>&1 | Select-Object -First 3)",
+      "PowerShell($models = @\\('qwen3:4b','qwen3:0.6b','gemma3:1b','llama3.2:1b','gemma2:2b'\\); foreach \\($m in $models\\) { Write-Output \"== pulling $m ==\"; ollama pull $m 2>&1 | Select-Object -Last 1 })"
+    ]
+  }
+}

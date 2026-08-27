@@ -9,8 +9,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-_SCREENSHOT_DIR = Path("/tmp/harness_screenshots")
-_SCREENSHOT_DIR.mkdir(exist_ok=True)
+from tools.platform_support import IS_MAC, IS_WINDOWS, harness_temp
+
+# Not Path("/tmp/..."): on Windows that resolves to 	mp\... on the current
+# drive and raises at import time, which took the whole tool registry down
+# with it. harness_temp() also creates parents, which `mkdir(exist_ok=True)`
+# did not.
+_SCREENSHOT_DIR = harness_temp("harness_screenshots")
 _counter = 0
 
 # Lazy globals
@@ -36,11 +41,14 @@ def _get_page():
         )
         context = _browser.new_context(
             viewport={"width": 1280, "height": 900},
+            # Match the host OS. A Mac UA sent from Windows is a mismatch
+            # against the client hints Chromium sends alongside it, which is
+            # exactly the inconsistency bot-detection looks for.
             user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " if IS_MAC else
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " if IS_WINDOWS else
+                "Mozilla/5.0 (X11; Linux x86_64) "
+            ) + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         )
         _page = context.new_page()
     return _page

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="QwenHarness.Desktop" />
+
+  <!--
+    DPI awareness is set by <ApplicationHighDpiMode>PerMonitorV2</> in the
+    csproj rather than here: on .NET 5+ WinForms owns that setting, and
+    declaring it in both places is what the WFAC010 analyzer flags.
+
+    longPathAware stays: without it a path over MAX_PATH (260 chars) fails,
+    and node_modules trees inside a granted project folder routinely exceed
+    that — the app would report files as missing that plainly exist.
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+
+  <!-- Declares support up to Windows 11 so version checks are not shimmed. -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" /><!-- 10 / 11 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}" /><!-- 8.1 -->
+    </application>
+  </compatibility>
+</assembly>

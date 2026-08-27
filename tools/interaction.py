@@ -6,19 +6,20 @@ terminal example scripts (examples/02_with_tools.py etc.), not inside the
 GUI's browser-side chat (which doesn't run this Python tool loop at all —
 see RUNBOOK.md for that boundary).
 
-create_display renders a self-contained HTML file to /tmp/harness_displays/
-and opens it (macOS `open`) — a lightweight way for an agent to hand the
-user something visual (a table, a small chart, a formatted report) instead
-of a wall of text.
+create_display renders a self-contained HTML file into the system temp
+directory and opens it with the OS default handler (`open` on macOS,
+`os.startfile` on Windows, `xdg-open` on Linux) — a lightweight way for an
+agent to hand the user something visual (a table, a small chart, a formatted
+report) instead of a wall of text.
 """
 
 from __future__ import annotations
-import subprocess
 import time
 from pathlib import Path
 
-_DISPLAY_DIR = Path("/tmp/harness_displays")
-_DISPLAY_DIR.mkdir(exist_ok=True)
+from tools.platform_support import harness_temp, open_path
+
+_DISPLAY_DIR = harness_temp("harness_displays")
 _counter = 0
 
 
@@ -46,13 +47,9 @@ def create_display(html: str, title: str = "Agent display", open_it: bool = True
   th, td {{ border: 1px solid #2a3140; padding: 8px 12px; text-align: left; }}
   th {{ background: #171c27; }}
   h1, h2, h3 {{ margin-top: 0; }}
-  code, pre {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+  code, pre {{ font-family: ui-monospace, SFMono-Regular, Consolas, Menlo, monospace; }}
 </style></head>
 <body>{html}</body></html>"""
     path.write_text(page, encoding="utf-8")
-    if open_it:
-        try:
-            subprocess.run(["open", str(path)], check=False)
-        except OSError:
-            pass
-    return {"status": "ok", "path": str(path)}
+    opened = open_path(path) if open_it else False
+    return {"status": "ok", "path": str(path), "opened": opened}

@@ -1,6 +1,26 @@
+# ── macOS build output ───────────────────────────────────────────────
 .build/
 dist/
+.DS_Store
+
+# ── Windows build output ─────────────────────────────────────────────
+# The .NET desktop app. bin/ and obj/ are per-machine build artefacts and
+# obj/ additionally contains absolute NuGet paths from the machine that
+# restored them, so committing it breaks the build on every other machine.
+windows/**/bin/
+windows/**/obj/
+# NOT ignored: windows/QwenHarnessDesktop/AppIcon.ico
+# It is derived from AppLogo.png, but it is committed anyway. MSBuild evaluates
+# <ApplicationIcon Condition="Exists(...)"> when the project loads — before the
+# target that would generate it runs — so on a fresh clone the executable would
+# build successfully with no icon at all. See the comment in the csproj.
+
+# ── Python ───────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
-.DS_Store
+
+# ── secrets and local state ──────────────────────────────────────────
 .env
+# The sandbox keeps one .bak of anything sandbox_promote overwrites. Useful
+# locally, never something to commit.
+*.qh.bak

@@ -792,26 +792,41 @@ def execute_tool(name: str, args: dict[str, Any]) -> Any:
             from tools.github import gh_get_file
             return gh_get_file(**args)
 
-        # Web tools (generic API access)
+        # Sandbox tools. agent_id matters: sandboxes are keyed on (run, agent)
+        # so parallel agents cannot overwrite each other's staged work, and a
+        # status/verify/promote without it would act on the wrong tree.
         elif name == "sandbox_status":
-            from tools.sandbox import get_sandbox
-            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"), create=False)
-            return sandbox.summary() if sandbox else {"error": "no sandbox for this run"}
+            from tools.sandbox import get_sandbox, sandboxes_for_run
+            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"),
+                                  agent_id=args.get("agent_id"), create=False)
+            if sandbox:
+                summary = sandbox.summary()
+                # Name the siblings, so an agent can see it is not working
+                # alone without being able to reach into their trees.
+                others = [box.agent_id for box in sandboxes_for_run(args.get("run_id", ""))
+                          if box.agent_id != sandbox.agent_id]
+                if others:
+                    summary["other_agents_in_run"] = others
+                return summary
+            return {"error": "no sandbox for this run"}
         elif name == "sandbox_verify":
             from tools.sandbox import get_sandbox
-            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"), create=False)
+            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"),
+                                  agent_id=args.get("agent_id"), create=False)
             if not sandbox:
                 return {"error": "no sandbox for this run — nothing staged yet"}
             return sandbox.verify(args.get("command"))
         elif name == "sandbox_promote":
             from tools.sandbox import get_sandbox
-            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"), create=False)
+            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"),
+                                  agent_id=args.get("agent_id"), create=False)
             if not sandbox:
                 return {"error": "no sandbox for this run — nothing staged to promote"}
             return sandbox.promote(force=bool(args.get("force")))
         elif name == "sandbox_discard":
             from tools.sandbox import get_sandbox
-            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"), create=False)
+            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"),
+                                  agent_id=args.get("agent_id"), create=False)
             return sandbox.discard() if sandbox else {"status": "ok", "discarded": 0}
         elif name == "fetch_data":
             from tools.web import fetch_data

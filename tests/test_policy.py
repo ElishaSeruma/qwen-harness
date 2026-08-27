@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from tools import files
 from tools import policy
+from tools.platform_support import IS_WINDOWS
 
 
 class ToolPolicyTests(unittest.TestCase):
@@ -58,21 +59,52 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertIn(extra.resolve(), policy.granted_roots())
 
     def test_revoked_grant_stops_being_granted(self):
-        # The dangerous staleness direction: a cache must never keep allowing
-        # a path after it is revoked.
+        """The dangerous staleness direction: the cache must never keep
+        allowing a path after the grant is revoked.
+
+        Asserted against the resolved ROOT LIST rather than is_granted().
+        is_granted() is an OR across every root, including the two the policy
+        grants unconditionally (the repo, and ~/.qwen-harness/sandboxes). A
+        temp directory is not reliably outside those: inside a sandbox run
+        TMPDIR points into the sandboxes tree, so mkdtemp() lands under a
+        permanently-granted root and the revoked path is still "granted" —
+        correctly, by a different root. That made this test fail only under
+        sandbox_verify, and a permanently red verify blocks every promotion.
+
+        The cache property being guarded is unchanged: after a revoking write,
+        the roots list must not still contain the revoked entry.
+        """
         outside = Path(tempfile.mkdtemp()).resolve()
         try:
             policy.atomic_write_json(self.permissions, {"roots": [str(self.root), str(outside)]})
+            self.assertIn(outside, policy.granted_roots())
             self.assertTrue(policy.is_granted(outside))
+
             policy.atomic_write_json(self.permissions, {"roots": [str(self.root)]})
-            self.assertFalse(policy.is_granted(outside))
+            self.assertNotIn(outside, policy.granted_roots(),
+                             "the cache served a revoked root")
+            # is_granted can still be True if an unconditional root happens to
+            # contain this temp path, so only assert it where it is meaningful.
+            if not any(outside.is_relative_to(root) for root in policy.granted_roots()):
+                self.assertFalse(policy.is_granted(outside))
         finally:
             outside.rmdir()
 
     def test_shell_executes_in_explicit_working_directory(self):
-        result = files.run_shell("pwd", cwd=str(self.root))
-        self.assertEqual(result["returncode"], 0)
+        # `pwd` prints a bare path in sh; in PowerShell it is an alias for
+        # Get-Location, which formats a table. Ask each shell for the string
+        # directly instead of parsing its default rendering.
+        command = "[Console]::Out.Write((Get-Location).ProviderPath)" if IS_WINDOWS else "pwd"
+        result = files.run_shell(command, cwd=str(self.root))
+        self.assertEqual(result["returncode"], 0, result)
         self.assertEqual(result["stdout"].strip(), str(self.root))
+
+    def test_shell_refuses_this_platforms_destructive_patterns(self):
+        """A Windows user previously had no guard: no Windows command contains
+        the substring "rm -rf"."""
+        destructive = "Remove-Item -Recurse -Force C:/" if IS_WINDOWS else "rm -rf /"
+        result = files.run_shell(destructive, cwd=str(self.root))
+        self.assertIn("Blocked dangerous command pattern", result["error"])
 
 
 if __name__ == "__main__":

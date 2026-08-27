@@ -32,6 +32,7 @@ import {
   apiAgentsGet, apiAgentsSave,
   apiSupabaseStatus, apiSupabaseConnect, apiSupabaseDisconnect,
   isDesktopClient, desktopChooseDirectory, desktopChooseFile,
+  loadPlatform, platform,
   getDirectory, setDirectory, getHotphrases, setHotphrases,
   getConnectors, setConnectorEnabled, CONNECTOR_DEFS,
   trackComposerFocus, insertIntoLastComposer, getLastComposerValue,
@@ -1542,7 +1543,10 @@ function renderWorkingDirDrawer() {
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'path-input';
-  input.placeholder = '/Users/you/some/project';
+  // A hard-coded Mac path here is not cosmetic: it is the example a user
+  // copies, and on Windows it cannot resolve. The server reports a real path
+  // for this machine.
+  input.placeholder = platform().example_project_path;
   input.value = effectiveWorkingDir();
   row.append(input);
 
@@ -1806,7 +1810,7 @@ async function renderSupabaseDrawer() {
   } else {
     const p2 = document.createElement('p');
     p2.className = 'panel-copy';
-    p2.innerHTML = 'From your Supabase project → Settings → API: paste the Project URL and the <strong>service_role</strong> secret key (not the anon key, not the database password). Stored locally on this Mac only (<code>~/.qwen-harness/secrets.json</code>), never in the browser or in this repo.';
+    p2.innerHTML = 'From your Supabase project → Settings → API: paste the Project URL and the <strong>service_role</strong> secret key (not the anon key, not the database password). Stored locally on this computer only (<code>~/.qwen-harness/secrets.json</code>), never in the browser or in this repo.';
     const form = document.createElement('form');
     form.className = 'composer';
     form.style.flexDirection = 'column'; form.style.alignItems = 'stretch';
@@ -2128,7 +2132,7 @@ async function renderGithubDrawer() {
   } else {
     const p2 = document.createElement('p');
     p2.className = 'panel-copy';
-    p2.innerHTML = 'Paste a <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener">Personal Access Token</a>. For project creation and push, use classic <code>repo</code> scope, or a fine-grained token with repository <strong>Contents: Read and write</strong>. It\'s stored locally on this Mac only (<code>~/.qwen-harness/secrets.json</code>), never in the browser or in this repo.';
+    p2.innerHTML = 'Paste a <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener">Personal Access Token</a>. For project creation and push, use classic <code>repo</code> scope, or a fine-grained token with repository <strong>Contents: Read and write</strong>. It\'s stored locally on this computer only (<code>~/.qwen-harness/secrets.json</code>), never in the browser or in this repo.';
     const form = document.createElement('form');
     form.className = 'composer';
     form.innerHTML = `<input type="password" placeholder="ghp_…" autocomplete="off" /><button type="submit">Connect</button>`;
@@ -2360,7 +2364,7 @@ async function grantAndOpenFolder() {
       const result = await desktopChooseDirectory();
       path = result.path;
     } else {
-      path = prompt('Folder path to grant:');
+      path = prompt(`Folder path to grant:\n\ne.g. ${platform().example_parent_dir}`);
     }
     if (!path) return;
     await apiFsGrant(path);
@@ -3049,7 +3053,7 @@ async function chooseProjectParent() {
       const result = await desktopChooseDirectory();
       path = result.path;
     } else {
-      path = prompt('Choose parent folder path:');
+      path = prompt(`Choose parent folder path:\n\ne.g. ${platform().example_parent_dir}`);
     }
     if (!path) return;
     await apiFsGrant(path);
@@ -4130,7 +4134,8 @@ async function pollOllama() {
   const pill = $('#ollama-status'); const label = $('#ollama-status-label');
   const modelPill = $('#model-status'); const modelLabel = $('#model-status-label');
   try {
-    const res = await fetch('http://localhost:11434/api/tags', { cache: 'no-store' });
+    // 127.0.0.1, not localhost — see the note in gui/agent-loop.js.
+    const res = await fetch('http://127.0.0.1:11434/api/tags', { cache: 'no-store' });
     if (!res.ok) throw new Error();
     const data = await res.json();
     const names = new Set((data.models || []).map(m => m.name));
@@ -4366,4 +4371,19 @@ document.addEventListener('visibilitychange', () => {
   if (servicesStatus?.state === 'running' || !$('#services-drawer').hidden) pollServices();
   if (!$('#view-projects').hidden) refreshProjects();
 });
+// Platform facts drive path placeholders and example paths. Fetched before
+// the first route paint so the Code page's path input never flashes a Mac
+// path on a Windows machine; a failure resolves to a neutral fallback rather
+// than blocking boot.
+loadPlatform().then((info) => {
+  applyPlatformPlaceholders(info);
+}).catch(() => {});
+
+function applyPlatformPlaceholders(info) {
+  const filetreePath = $('#filetree-path');
+  if (filetreePath) filetreePath.placeholder = info.example_project_path;
+  const parentDir = $('#project-parent-dir');
+  if (parentDir) parentDir.placeholder = info.example_parent_dir;
+}
+
 switchRoute(localStorage.getItem(ROUTE_KEY) || 'home');

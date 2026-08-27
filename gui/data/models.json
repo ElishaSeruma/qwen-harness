@@ -4,37 +4,37 @@
     {
       "key": "qwen3:4b",
       "name": "qwen3:4b",
-      "base_url": "http://localhost:11434/v1",
+      "base_url": "http://127.0.0.1:11434/v1",
       "local": true
     },
     {
       "key": "qwen3:0.6b",
       "name": "qwen3:0.6b",
-      "base_url": "http://localhost:11434/v1",
+      "base_url": "http://127.0.0.1:11434/v1",
       "local": true
     },
     {
       "key": "gemma3:1b",
       "name": "gemma3:1b",
-      "base_url": "http://localhost:11434/v1",
+      "base_url": "http://127.0.0.1:11434/v1",
       "local": true
     },
     {
       "key": "llama3.2:1b",
       "name": "llama3.2:1b",
-      "base_url": "http://localhost:11434/v1",
+      "base_url": "http://127.0.0.1:11434/v1",
       "local": true
     },
     {
       "key": "llama3.2:1b-instruct-q4_K_M",
       "name": "llama3.2:1b-instruct-q4_K_M",
-      "base_url": "http://localhost:11434/v1",
+      "base_url": "http://127.0.0.1:11434/v1",
       "local": true
     },
     {
       "key": "gemma2:2b",
       "name": "gemma2:2b",
-      "base_url": "http://localhost:11434/v1",
+      "base_url": "http://127.0.0.1:11434/v1",
       "local": true
     },
     {

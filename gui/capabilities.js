@@ -414,8 +414,21 @@ window.__qhDesktopResolve = (id, payload) => {
   else pending.reject(Object.assign(new Error(payload?.cancelled ? 'cancelled' : (payload?.error || 'desktop action failed')), payload));
 };
 
+// Two desktop hosts, one protocol. The Mac app is WKWebView, which exposes a
+// named message handler; the Windows app is WebView2, which has exactly one
+// channel (`window.chrome.webview.postMessage`) shared by everything. Both
+// send the same `{ id, action }` envelope and both call back through
+// `window.__qhDesktopResolve`, so nothing above this line has to know which
+// host it is running in — and a plain browser tab, which has neither, keeps
+// falling back to the typed-path input exactly as before.
+function desktopHost() {
+  if (window.webkit?.messageHandlers?.desktop) return 'wkwebview';
+  if (window.chrome?.webview?.postMessage) return 'webview2';
+  return null;
+}
+
 export function isDesktopClient() {
-  return Boolean(window.webkit?.messageHandlers?.desktop);
+  return Boolean(desktopHost());
 }
 
 export function desktopChooseDirectory() {
@@ -427,12 +440,53 @@ export function desktopChooseFile() {
 }
 
 function desktopAction(action) {
-  if (!isDesktopClient()) return Promise.reject(new Error('desktop bridge unavailable'));
+  const host = desktopHost();
+  if (!host) return Promise.reject(new Error('desktop bridge unavailable'));
   const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   return new Promise((resolve, reject) => {
     desktopPending.set(id, { resolve, reject });
-    window.webkit.messageHandlers.desktop.postMessage({ id, action });
+    const message = { id, action };
+    if (host === 'wkwebview') window.webkit.messageHandlers.desktop.postMessage(message);
+    // WebView2 accepts an object and delivers it as WebMessageAsJson; sending
+    // the JSON string instead would arrive as a quoted string, not an object.
+    else window.chrome.webview.postMessage(message);
   });
+}
+
+// ── platform facts, fetched once ────────────────────────────────────────
+// The frontend cannot ask the browser what the *host* filesystem looks like:
+// `navigator.platform` describes the renderer, and in the desktop app it is
+// the same engine on both. The server knows, so it says so. This is what
+// keeps a "/Users/you/some/project" placeholder off a Windows machine — an
+// example path a user copies has to be one that can actually resolve.
+let platformInfo = null;
+let platformPromise = null;
+
+const PLATFORM_FALLBACK = {
+  platform: 'unknown',
+  is_windows: false,
+  shell: 'sh',
+  path_separator: '/',
+  example_project_path: '~/Projects/my-app',
+  example_parent_dir: '~/Projects',
+};
+
+export async function loadPlatform() {
+  if (platformInfo) return platformInfo;
+  if (!platformPromise) {
+    platformPromise = fetch(`${API}/api/platform`)
+      .then((res) => (res.ok ? res.json() : PLATFORM_FALLBACK))
+      // A failed fetch must not break boot: every consumer of this is a label
+      // or a placeholder, never a code path.
+      .catch(() => PLATFORM_FALLBACK)
+      .then((info) => { platformInfo = info; return info; });
+  }
+  return platformPromise;
+}
+
+/** Synchronous read of whatever loadPlatform() last resolved. */
+export function platform() {
+  return platformInfo || PLATFORM_FALLBACK;
 }
 
 // ── persisted state ─────────────────────────────────────────────────────

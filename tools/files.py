@@ -1,13 +1,37 @@
 """
 tools/files.py – file system and shell tools.
+
+`search_files` and `find_files` are implemented in pure Python rather than by
+shelling out to grep/find. That started as a Windows necessity and is now the
+behaviour everywhere, because the shell-out was quietly wrong on Windows in the
+worst possible way: `find.exe` on Windows is a *string search* utility, so
+`find <path> -name "*.py"` does not fail — it prints a usage error to stderr,
+exits non-zero, and `find_files` returned `{"status": "ok", "files": []}`. An
+agent asking "where are the tests?" was told, authoritatively, that there are
+none. grep is likewise absent unless Git's `usr/bin` happens to be on PATH.
+
+One implementation for both platforms also means the exclusions (.git,
+node_modules, __pycache__, .build) and the result caps are defined once instead
+of drifting between two command lines.
 """
 
 from __future__ import annotations
+import fnmatch
 import os
+import re
 import subprocess
+import time
 from pathlib import Path
 
+from tools.platform_support import blocked_pattern, shell_argv, quiet_kwargs
 from tools.policy import PermissionDenied, require_path
+
+# Directories never descended into by search_files / find_files. Walking
+# node_modules is what turned a "search the project" call into a 20s timeout.
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".build", ".venv", "venv",
+             "dist", "build", ".next", ".tox", ".mypy_cache", ".pytest_cache"}
+SEARCH_TIMEOUT_S = 20
+MAX_SEARCHED_BYTES = 2 * 1024 * 1024   # skip anything bigger; it is not source
 
 
 def read_file(path: str, cwd: str | None = None) -> dict:
@@ -79,25 +103,32 @@ def list_dir(path: str, cwd: str | None = None) -> dict:
 def run_shell(command: str, timeout: int = 30, cwd: str | None = None) -> dict:
     """
     Run a shell command. Returns stdout, stderr, and return code.
-    Restricted: no sudo, no rm -rf.
+    Restricted: refuses the platform's destructive command patterns.
+
+    The shell is /bin/sh on macOS/Linux and PowerShell on Windows (override
+    with the QH_SHELL environment variable).
     """
-    # Basic safety guard
-    dangerous = ["sudo", "rm -rf", "mkfs", ":(){:|:&};:"]
-    for d in dangerous:
-        if d in command:
-            return {"error": f"Blocked dangerous command pattern: '{d}'"}
+    # Basic safety guard. The pattern list is platform-aware: "rm -rf" never
+    # appears in the Windows command that does the same damage, so a Windows
+    # user previously had no guard at all.
+    blocked = blocked_pattern(command)
+    if blocked:
+        return {"error": f"Blocked dangerous command pattern: '{blocked}'"}
 
     try:
         working_dir = require_path(cwd or ".")
         if not working_dir.is_dir():
             return {"error": f"Working directory is not a directory: {working_dir}"}
+        # Explicit argv rather than shell=True: on Windows shell=True means
+        # cmd.exe, which is neither what a Windows developer types nor able to
+        # report a faithful exit code for a chained command.
         result = subprocess.run(
-            command,
-            shell=True,
+            shell_argv(command),
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=working_dir,
+            **quiet_kwargs(),
         )
         return {
             "status": "ok",
@@ -143,6 +174,20 @@ def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = F
     return {"status": "ok", "path": str(p), "replacements": count if replace_all else 1}
 
 
+def _walk(root: Path, deadline: float):
+    """Yield files under `root`, skipping vendor/build dirs and honouring a deadline.
+
+    os.walk with in-place `dirnames` pruning is what keeps node_modules out of
+    the traversal entirely rather than filtering it after the fact.
+    """
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            if time.monotonic() > deadline:
+                return
+            yield Path(dirpath) / name
+
+
 def search_files(query: str, path: str = ".", glob: str | None = None, max_results: int = 30, cwd: str | None = None) -> dict:
     """
     Search file contents recursively for a string/regex (like grep -rn).
@@ -155,25 +200,41 @@ def search_files(query: str, path: str = ".", glob: str | None = None, max_resul
         return {"error": str(exc), "permission_required": True, "path": str(exc.path)}
     if not p.exists():
         return {"error": f"Path not found: {path}"}
-    args = ["grep", "-rn", "--binary-files=without-match",
-            "--exclude-dir=.git", "--exclude-dir=node_modules", "--exclude-dir=__pycache__",
-            "--exclude-dir=.build", "-E", query]
-    if glob:
-        args.insert(-2, f"--include={glob}")
-    args.append(str(p))
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=20)
-    except subprocess.TimeoutExpired:
-        return {"error": "search timed out after 20s — narrow the path or query"}
-    if result.returncode == 2:
-        return {"error": result.stderr.strip()[:500] or "grep failed"}
-    lines = result.stdout.splitlines()
-    matches = []
-    for line in lines[:max_results]:
-        file_part, _, rest = line.partition(":")
-        lineno, _, text = rest.partition(":")
-        matches.append({"file": file_part, "line": lineno, "text": text.strip()[:200]})
-    return {"status": "ok", "query": query, "matches": matches, "truncated": len(lines) > max_results}
+        pattern = re.compile(query)
+    except re.error as exc:
+        return {"error": f"invalid regex: {exc}"}
+
+    deadline = time.monotonic() + SEARCH_TIMEOUT_S
+    matches: list[dict] = []
+    truncated = False
+    targets = [p] if p.is_file() else _walk(p, deadline)
+    for candidate in targets:
+        if time.monotonic() > deadline:
+            truncated = True
+            break
+        if glob and not fnmatch.fnmatch(candidate.name, glob):
+            continue
+        try:
+            if candidate.stat().st_size > MAX_SEARCHED_BYTES:
+                continue
+            # errors="replace" rather than skipping undecodable files: a source
+            # file with one stray byte should still be searchable.
+            with candidate.open("r", encoding="utf-8", errors="replace") as handle:
+                for lineno, line in enumerate(handle, 1):
+                    if chr(0) in line:    # binary — grep's --binary-files=without-match
+                        break
+                    if pattern.search(line):
+                        if len(matches) >= max_results:
+                            truncated = True
+                            break
+                        matches.append({"file": str(candidate), "line": str(lineno),
+                                        "text": line.strip()[:200]})
+        except (OSError, ValueError):
+            continue
+        if truncated:
+            break
+    return {"status": "ok", "query": query, "matches": matches, "truncated": truncated}
 
 
 def find_files(pattern: str, path: str = ".", max_results: int = 50, cwd: str | None = None) -> dict:
@@ -184,13 +245,16 @@ def find_files(pattern: str, path: str = ".", max_results: int = 50, cwd: str | 
         return {"error": str(exc), "permission_required": True, "path": str(exc.path)}
     if not p.exists():
         return {"error": f"Path not found: {path}"}
-    try:
-        result = subprocess.run(
-            ["find", str(p), "-name", pattern, "-not", "-path", "*/.git/*",
-             "-not", "-path", "*/node_modules/*", "-not", "-path", "*/__pycache__/*"],
-            capture_output=True, text=True, timeout=20,
-        )
-    except subprocess.TimeoutExpired:
-        return {"error": "find timed out after 20s — narrow the path"}
-    files = result.stdout.splitlines()
-    return {"status": "ok", "pattern": pattern, "files": files[:max_results], "truncated": len(files) > max_results}
+
+    deadline = time.monotonic() + SEARCH_TIMEOUT_S
+    files: list[str] = []
+    truncated = False
+    for candidate in _walk(p, deadline):
+        # Match on the bare name, as `find -name` does — not the full path, or
+        # "*.py" would also need to match the directories above it.
+        if fnmatch.fnmatch(candidate.name, pattern):
+            if len(files) >= max_results:
+                truncated = True
+                break
+            files.append(str(candidate))
+    return {"status": "ok", "pattern": pattern, "files": files, "truncated": truncated}

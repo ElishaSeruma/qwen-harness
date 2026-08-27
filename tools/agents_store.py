@@ -20,8 +20,31 @@ from typing import Any
 from tools.policy import STATE_DIR, atomic_write_json
 
 AGENTS_PATH = STATE_DIR / "agents.json"
-AGENT_FIELDS = ("id", "name", "slug", "nickname", "modelKey")
+
+# Identity, plus the four-part contract qwen-code gives a subagent: an owner,
+# a file boundary, an output format, and a finish condition.
+#
+# The first five fields are identity and were always here. The last three are
+# the contract, and they are what make more than one agent working at once
+# something other than a race:
+#
+#   fileBoundary    glob list, enforced in tools/sandbox.py at the same
+#                   chokepoint that resolves every agent-supplied path
+#   outputFormat    free text or a schema description, appended to the prompt
+#   finishCondition a sentence the agent is told it must satisfy to be done
+#
+# All three are optional and default to empty. An empty boundary allows
+# everything, so existing single-agent rosters behave exactly as before —
+# a boundary is an opt-in contract, and defaulting to deny would break every
+# roster already on disk.
+AGENT_FIELDS = (
+    "id", "name", "slug", "nickname", "modelKey",
+    "fileBoundary", "outputFormat", "finishCondition",
+)
+CONTRACT_FIELDS = ("fileBoundary", "outputFormat", "finishCondition")
 MAX_AGENTS = 50
+MAX_BOUNDARY_PATTERNS = 24
+MAX_CONTRACT_CHARS = 2000
 
 
 def load() -> dict[str, Any]:
@@ -44,13 +67,66 @@ def get() -> dict[str, Any]:
     }
 
 
+def _clean_boundary(value: Any) -> list[str]:
+    """Normalise a file boundary to a list of glob strings.
+
+    Accepts a list or a comma/newline separated string, because the GUI field
+    is a textarea and the API is JSON. Anything unusable becomes an empty
+    boundary rather than a broken one — a malformed pattern that silently
+    matched nothing would deny every write and read as the agent being
+    inexplicably unable to edit anything.
+    """
+    if isinstance(value, str):
+        parts = [part.strip() for chunk in value.splitlines() for part in chunk.split(",")]
+    elif isinstance(value, (list, tuple)):
+        parts = [str(part).strip() for part in value]
+    else:
+        return []
+    seen, out = set(), []
+    for part in parts:
+        # A leading "/" or a drive letter would be an absolute path, which is
+        # meaningless against a project-relative path and would silently never
+        # match. Strip it rather than accept a pattern that cannot fire.
+        part = part.lstrip("/\\").strip()
+        if not part or part in seen:
+            continue
+        seen.add(part)
+        out.append(part)
+        if len(out) >= MAX_BOUNDARY_PATTERNS:
+            break
+    return out
+
+
 def _clean(agents: Any) -> list[dict[str, Any]]:
     rows = []
     for agent in (agents or [])[:MAX_AGENTS]:
         if not isinstance(agent, dict) or not agent.get("id"):
             continue
-        rows.append({key: agent.get(key) for key in AGENT_FIELDS})
+        row = {key: agent.get(key) for key in AGENT_FIELDS}
+        row["fileBoundary"] = _clean_boundary(row.get("fileBoundary"))
+        for key in ("outputFormat", "finishCondition"):
+            value = row.get(key)
+            row[key] = str(value).strip()[:MAX_CONTRACT_CHARS] if value else ""
+        rows.append(row)
     return rows
+
+
+def contract_for(agent_id: str) -> dict[str, Any]:
+    """One agent's boundary/format/finish contract, or empty defaults.
+
+    Read by gui/server.py on every sandboxed tool call, so it reads from the
+    same on-disk roster every client syncs against rather than trusting what
+    the browser sent — an agent that could declare its own boundary per call
+    could widen it per call.
+    """
+    for agent in get().get("agents", []):
+        if agent.get("id") == agent_id:
+            return {
+                "fileBoundary": _clean_boundary(agent.get("fileBoundary")),
+                "outputFormat": (agent.get("outputFormat") or "").strip(),
+                "finishCondition": (agent.get("finishCondition") or "").strip(),
+            }
+    return {"fileBoundary": [], "outputFormat": "", "finishCondition": ""}
 
 
 def save(payload: dict[str, Any]) -> dict[str, Any]:

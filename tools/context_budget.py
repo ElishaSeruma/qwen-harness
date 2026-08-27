@@ -25,10 +25,11 @@ That gives ~0.173 GB per 1k tokens of KV cache and ~2.46 GB of weights for a
 
 from __future__ import annotations
 
-import os
 import re
-import subprocess
 from typing import Any
+
+from tools.platform_support import IS_WINDOWS
+from tools.sysinfo import total_memory_gb
 
 # Fitted from the measurements in the docstring, expressed per billion params
 # so they extrapolate to the rest of the roster.
@@ -37,7 +38,13 @@ KV_GB_PER_B_PER_1K = 0.043   # KV cache, per 1k tokens of context
 
 # Left for the OS, the harness, a browser, and whatever else you are doing —
 # the machine is a laptop you are also using, not a dedicated inference box.
-RESERVED_GB = 2.5
+#
+# Windows needs more headroom than macOS for the same felt experience: a
+# freshly booted Windows 11 desktop sits around 4-5 GB resident before a
+# browser is open, where macOS compresses aggressively and reports far less.
+# Reserving the macOS 2.5 GB on Windows sized a context that fit the fitted
+# formula and then swapped in practice.
+RESERVED_GB = 4.0 if IS_WINDOWS else 2.5
 
 MIN_CONTEXT = 4096           # never go below Ollama's own default
 MAX_CONTEXT = 65536          # beyond this, prompt-eval latency hurts more than it helps
@@ -45,21 +52,14 @@ CONTEXT_STEPS = (4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536)
 
 
 def total_ram_gb() -> float:
-    """Physical RAM in GB. Falls back to a conservative 8 GB if unknown."""
-    try:
-        if hasattr(os, "sysconf") and "SC_PAGE_SIZE" in os.sysconf_names:
-            pages = os.sysconf("SC_PHYS_PAGES")
-            page = os.sysconf("SC_PAGE_SIZE")
-            if pages > 0 and page > 0:
-                return pages * page / (1024 ** 3)
-    except (ValueError, OSError):
-        pass
-    try:  # macOS
-        out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
-                             text=True, timeout=5)
-        return int(out.stdout.strip()) / (1024 ** 3)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return 8.0
+    """Physical RAM in GB. Falls back to a conservative 8 GB if unknown.
+
+    `os.sysconf` does not exist on Windows and `sysctl` is macOS-only, so this
+    used to fall all the way through to the 8 GB default on a Windows machine
+    — sizing every context as if half the RAM were missing. tools/sysinfo.py
+    reads the real figure from GlobalMemoryStatusEx there.
+    """
+    return total_memory_gb(default=8.0)
 
 
 def parse_param_billions(parameter_size: str | None) -> float | None:

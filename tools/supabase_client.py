@@ -113,7 +113,7 @@ def embed_text(text: str) -> list[float] | None:
     """Embed `text` via Ollama's local embedding model. Returns None if unavailable."""
     try:
         req = urllib.request.Request(
-            "http://localhost:11434/api/embeddings",
+            "http://127.0.0.1:11434/api/embeddings",
             data=json.dumps({"model": EMBEDDING_MODEL, "prompt": text}).encode(),
             headers={"Content-Type": "application/json"},
         )

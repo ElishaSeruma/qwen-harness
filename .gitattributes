@@ -1,0 +1,50 @@
+# Line endings, now that this repo is checked out on both macOS and Windows.
+#
+# Without this file, Git's autocrlf on a Windows checkout rewrites every text
+# file's line endings, and two categories break outright:
+#
+#   * A .sh file with CRLF fails on macOS/Linux with
+#     "bad interpreter: /bin/bash^M" — the shebang line's trailing \r becomes
+#     part of the interpreter path. setup.sh, wake-up.sh and script/*.sh would
+#     be unrunnable for anyone who pushed from Windows.
+#   * A .ps1 file must keep its UTF-8 BOM. Windows PowerShell 5.1 reads a
+#     BOM-less script as ANSI, which mangles every non-ASCII character
+#     mid-string and breaks the parse. `working-tree-encoding` is deliberately
+#     NOT used here (it would strip the BOM); the files are simply left alone.
+
+# Default: normalise to LF in the repository, let Git decide the working copy.
+* text=auto eol=lf
+
+# ── must be LF, everywhere, always ───────────────────────────────────
+*.sh        text eol=lf
+*.py        text eol=lf
+*.js        text eol=lf
+*.cjs       text eol=lf
+*.mjs       text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.sql       text eol=lf
+*.swift     text eol=lf
+*.toml      text eol=lf
+*.txt       text eol=lf
+
+# ── must be CRLF: native Windows tooling ─────────────────────────────
+# PowerShell, MSBuild and the C# compiler all handle LF fine, but these files
+# are routinely opened in Notepad and in Visual Studio, both of which are
+# happier with CRLF — and unlike the .sh case, nothing here breaks either way.
+*.ps1       text eol=crlf
+*.psm1      text eol=crlf
+*.cmd       text eol=crlf
+*.bat       text eol=crlf
+*.cs        text eol=crlf
+*.csproj    text eol=crlf
+*.sln       text eol=crlf
+*.manifest  text eol=crlf
+
+# ── binary: never touched, never diffed as text ──────────────────────
+*.png       binary
+*.ico       binary
+*.icns      binary
+*.pdf       binary

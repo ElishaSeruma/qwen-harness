@@ -12,7 +12,14 @@ import {
   TIERS, tierFor, tierName, toolsForTier, weighTask, routeTask,
 } from './weighbridge.js';
 
-const OLLAMA_URL = 'http://localhost:11434/v1/chat/completions';
+// Ollama binds 127.0.0.1 only, and on Windows `localhost` resolves to ::1
+// first. Measured: a request to http://localhost:11434 costs 2133 ms because
+// the ::1 attempt has to fail before the IPv4 fallback is tried, against 8 ms
+// to http://127.0.0.1:11434 — a 266x penalty, and this is the URL every single
+// inference request goes to. Browsers vary in how aggressively they fall back;
+// the literal address removes the question entirely.
+const OLLAMA_ORIGIN = 'http://127.0.0.1:11434';
+const OLLAMA_URL = `${OLLAMA_ORIGIN}/v1/chat/completions`;
 // TIME is the primary limit, not tokens.
 //
 // On this hardware tokens are a bad proxy for what you actually care about.
@@ -72,7 +79,7 @@ const EFFORT_ESCALATION_TOOL = {
 // So the loop talks to the NATIVE /api/chat endpoint, which does accept
 // per-request options. The response shape differs from OpenAI's and is
 // normalised back to it here so nothing downstream has to care.
-const OLLAMA_CHAT_URL = 'http://localhost:11434/api/chat';
+const OLLAMA_CHAT_URL = `${OLLAMA_ORIGIN}/api/chat`;
 
 async function streamCompletion(body, signal, onToken, onReasoning) {
   const { model, messages, tools, max_tokens, temperature, think, num_ctx } = body;
@@ -319,7 +326,7 @@ async function contextForModel(modelKey) {
 let modelInfoPromise = null;
 async function loadModelInfo() {
   if (!modelInfoPromise) {
-    modelInfoPromise = fetch('http://localhost:11434/api/tags', { cache: 'no-store' })
+    modelInfoPromise = fetch(`${OLLAMA_ORIGIN}/api/tags`, { cache: 'no-store' })
       .then(r => r.json())
       .then(data => new Map((data.models || []).map(m => [
         m.name,

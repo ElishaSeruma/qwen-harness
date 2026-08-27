@@ -1,0 +1,133 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The Windows counterpart to Package.swift + Sources/QwenHarnessDesktop.
+
+    WinForms rather than WPF: this app is a chrome-less shell around one
+    WebView2 control plus a toolbar. WinForms gives that in a fraction of the
+    XAML, and its FolderBrowserDialog/OpenFileDialog are the modern IFileDialog
+    shells on .NET 5+, which is exactly what the desktop bridge needs.
+
+    net8.0-windows, not net9.0: 8 is the LTS and the Microsoft.WindowsDesktop.App
+    runtime most likely to already be on a user's machine. The SDK on this
+    machine is 9.x, which builds net8.0 targets fine.
+  -->
+  <PropertyGroup>
+    <!-- The qwen-harness checkout, two levels up from this project. -->
+    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../../'))</RepoRoot>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>QwenHarnessDesktop</AssemblyName>
+    <RootNamespace>QwenHarness.Desktop</RootNamespace>
+    <!-- AppIcon.ico is generated from AppLogo.png by
+         script/render_app_icon_windows.py and IS committed, deliberately.
+
+         The alternative - .gitignore it and generate at build time - does not
+         work, and the way it fails is instructive: MSBuild evaluates property
+         and item conditions when the project is LOADED, before any target
+         runs. So on a fresh clone `Condition="Exists('AppIcon.ico')"` is false,
+         the GenerateAppIcon target then creates the file, and the compile
+         proceeds with no <ApplicationIcon> at all. The build succeeds and the
+         executable silently has no icon. Verified: 0 embedded PNG entries.
+
+         Committing it removes the ordering hazard entirely. GenerateAppIcon
+         below still regenerates it whenever AppLogo.png changes, so the two
+         cannot drift. The Condition stays as a guard for the case where
+         someone deletes the file. -->
+    <ApplicationIcon Condition="Exists('AppIcon.ico')">AppIcon.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- WinForms owns DPI configuration on .NET 5+ (WFAC010): declaring it in
+         the manifest as well is what the analyzer objects to. PerMonitorV2 is
+         what keeps WebView2 content sharp when the window moves between
+         monitors with different scale factors, not just at launch. -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!-- MSB3277: the WebView2 package ships WinForms *and* WPF assemblies, and
+         the WPF one references a newer WindowsBase. Only the WinForms control
+         is referenced here, so the WPF assembly is never loaded and the
+         unification warning describes a conflict that cannot occur at run
+         time. Downgraded rather than left to bury real reference problems in
+         40 lines of noise on every build. -->
+    <MSBuildWarningsAsMessages>MSB3277</MSBuildWarningsAsMessages>
+    <Version>1.0.0</Version>
+    <Product>Qwen Harness</Product>
+    <AssemblyTitle>Qwen Harness</AssemblyTitle>
+    <!-- Self-contained publishing is deliberately NOT the default: the app is
+         a launcher for a Python server that already has to be installed, so a
+         framework-dependent build keeps the output small and the build fast. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Copied NEXT TO the executable, not merely included.
+         <ApplicationIcon> embeds the icon in the PE resource section, which is
+         what Explorer and a pinned taskbar shortcut read - but it does nothing
+         for Form.Icon, which is what draws the title bar, the running taskbar
+         button and the Alt-Tab entry. MainForm.LoadAppIcon() reads this file
+         at runtime; without CopyToOutputDirectory it was simply not there,
+         Form.Icon stayed null, and the window showed the generic WinForms
+         icon while Explorer showed the right one. -->
+    <Content Include="AppIcon.ico" Condition="Exists('AppIcon.ico')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!--
+    Generate AppIcon.ico from the repo's AppLogo.png at build time.
+
+    This is what makes `dotnet build` work on a fresh clone without anyone
+    having run build_and_run.ps1 first - script/test.ps1 builds the project
+    directly, and so does an IDE. The .ico is a derived binary and is
+    .gitignored, so without this a clean checkout failed with CS7064.
+
+    Inputs/Outputs give MSBuild incremental build: skipped entirely unless
+    AppLogo.png is newer than the .ico. ContinueOnError means a machine
+    without Python or Pillow still builds, just without the custom icon,
+    which the Condition on <ApplicationIcon> then handles.
+  -->
+  <Target Name="GenerateAppIcon"
+          BeforeTargets="BeforeBuild"
+          Inputs="$(RepoRoot)AppLogo.png"
+          Outputs="$(MSBuildProjectDirectory)/AppIcon.ico"
+          Condition="Exists('$(RepoRoot)AppLogo.png')">
+    <Exec Command="python &quot;$(RepoRoot)script/render_app_icon_windows.py&quot; &quot;$(RepoRoot)AppLogo.png&quot; &quot;$(MSBuildProjectDirectory)/AppIcon.ico&quot;"
+          ContinueOnError="true"
+          StandardOutputImportance="low" />
+
+    <!-- If the file did not exist when the project was evaluated, the static
+         <ApplicationIcon> and <Content> above both condition'd themselves out.
+         Properties and items declared INSIDE a target are evaluated when the
+         target runs, so re-declaring them here recovers that case - and
+         BeforeBuild is early enough that the compiler and the copy-to-output
+         step both still see them. -->
+    <PropertyGroup Condition="Exists('$(MSBuildProjectDirectory)/AppIcon.ico')">
+      <ApplicationIcon>AppIcon.ico</ApplicationIcon>
+    </PropertyGroup>
+    <Warning Condition="!Exists('$(MSBuildProjectDirectory)/AppIcon.ico')"
+             Text="AppIcon.ico could not be generated (is Python with Pillow installed?). Building without a custom app icon." />
+  </Target>
+
+  <!--
+    Belt and braces for the file landing next to the executable, which is what
+    MainForm.LoadAppIcon() reads for the title bar and taskbar button.
+
+    The <Content> item above handles the normal case, but it too is
+    condition-evaluated at project load: if AppIcon.ico was missing then and
+    GenerateAppIcon created it mid-build, the item never existed and nothing
+    was copied. A plain Copy task after Build has no evaluation-order problem
+    at all, and SkipUnchangedFiles makes the redundant case free.
+  -->
+  <Target Name="CopyAppIconToOutput" AfterTargets="Build"
+          Condition="Exists('$(MSBuildProjectDirectory)/AppIcon.ico')">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/AppIcon.ico"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

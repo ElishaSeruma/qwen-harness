@@ -27,7 +27,16 @@ class PathRepairTests(unittest.TestCase):
     command the sandbox runs.
     """
 
-    FINDER_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+    # The bare PATH a GUI-launched process is handed. On macOS that is
+    # literally what Finder provides; on Windows there is no single such
+    # value, so use the two directories that are always present — the point of
+    # the test is that repair_path() adds the real install locations back to a
+    # minimal PATH, whatever "minimal" means on this OS.
+    FINDER_PATH = (
+        os.pathsep.join([os.environ.get("SystemRoot", r"C:\Windows") + r"\System32",
+                         os.environ.get("SystemRoot", r"C:\Windows")])
+        if os.name == "nt" else "/usr/bin:/bin:/usr/sbin:/sbin"
+    )
 
     def setUp(self):
         self.server = load_server()
@@ -39,7 +48,7 @@ class PathRepairTests(unittest.TestCase):
     def test_repair_adds_the_usual_binary_locations(self):
         os.environ["PATH"] = self.FINDER_PATH
         repaired = self.server.repair_path()
-        self.assertIn(self.FINDER_PATH.split(":")[0], repaired)
+        self.assertIn(self.FINDER_PATH.split(os.pathsep)[0], repaired)
         for extra in self.server.EXTRA_PATH_DIRS:
             if os.path.isdir(extra):
                 self.assertIn(extra, repaired, f"{extra} exists but was not added")
@@ -56,8 +65,9 @@ class PathRepairTests(unittest.TestCase):
         self.assertEqual(once, twice, "repeated repair must not duplicate entries")
 
     def test_repair_preserves_existing_entries(self):
-        os.environ["PATH"] = f"/some/custom/bin{os.pathsep}{self.FINDER_PATH}"
-        self.assertIn("/some/custom/bin", self.server.repair_path())
+        custom = r"C:\some\custom\bin" if os.name == "nt" else "/some/custom/bin"
+        os.environ["PATH"] = f"{custom}{os.pathsep}{self.FINDER_PATH}"
+        self.assertIn(custom, self.server.repair_path())
 
     def test_find_ollama_works_without_it_being_on_path(self):
         os.environ["PATH"] = self.FINDER_PATH
@@ -68,6 +78,8 @@ class PathRepairTests(unittest.TestCase):
         self.assertTrue(os.access(found, os.X_OK), "must return an executable path")
 
 
+@unittest.skipIf(os.name == "nt", "no /usr/bin/python3 on Windows; the desktop "
+                                   "app resolves a real python.exe explicitly")
 class ServerInterpreterCompatibilityTests(unittest.TestCase):
     def test_server_imports_under_system_python(self):
         """The app spawns whatever `python3` resolves to.
