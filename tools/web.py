@@ -129,23 +129,134 @@ def web_search(query: str, max_results: int = 5) -> dict:
         return {"error": str(e)}
 
 
-def scrape_url(url: str, max_chars: int = MAX_SCRAPE_CHARS) -> dict:
-    """Fetch `url` and return its readable text content (HTML stripped)."""
+# Below this, a "successful" scrape returned nothing a model can actually use.
+MIN_USEFUL_CHARS = 40
+
+# Sites known to serve an empty shell to a plain HTTP fetch. Listing them lets
+# scrape_url skip the pointless static request and render immediately; anything
+# NOT on the list still gets the cheap path first and only falls back when the
+# extraction actually comes back empty, so the list never needs to be complete.
+SPA_DOMAINS = frozenset({
+    "instagram.com", "x.com", "twitter.com", "facebook.com", "threads.net",
+    "tiktok.com", "linkedin.com", "reddit.com", "medium.com", "notion.so",
+    "airbnb.com", "discord.com", "slack.com", "figma.com", "netflix.com",
+    "youtube.com", "pinterest.com", "quora.com", "producthunt.com",
+})
+
+
+def _registrable_domain(url: str) -> str:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    parts = host.split(".")
+    # Good enough for matching a known list: last two labels.
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def is_spa_domain(url: str) -> bool:
+    return _registrable_domain(url) in SPA_DOMAINS
+
+
+def _render(url: str, max_chars: int, reason: str) -> dict:
+    """Read a page with headless Chromium, reporting honestly if it can't."""
+    try:
+        from tools.browser import render_url, RendererUnavailable
+    except ImportError as exc:
+        return {"error": f"renderer unavailable: {exc}", "url": url, "readable": False}
+    try:
+        result = render_url(url, max_chars=max_chars)
+    except Exception as exc:
+        # Includes RendererUnavailable, whose message carries the install command.
+        return {
+            "error": (
+                f"This page needs JavaScript rendering ({reason}), but it could not be "
+                f"rendered: {exc} Do NOT guess what the page said."
+            ),
+            "url": url,
+            "readable": False,
+            "needs_rendering": True,
+        }
+    if len((result.get("text") or "").strip()) < MIN_USEFUL_CHARS:
+        return {
+            "error": (
+                "Rendered the page but it still showed no readable text — it is most "
+                "likely behind a login or a bot check. Do NOT guess what it said."
+            ),
+            "url": url,
+            "title": result.get("title", ""),
+            "readable": False,
+            "rendered": True,
+        }
+    return {**result, "via": "headless-browser", "reason": reason}
+
+
+def scrape_url(url: str, max_chars: int = MAX_SCRAPE_CHARS, allow_render: bool = True) -> dict:
+    """Fetch `url` and return its readable text content (HTML stripped).
+
+    JavaScript-rendered pages are handled automatically: known SPA domains go
+    straight to a headless browser, and anything else falls back to one when
+    the static fetch turns up nothing readable. Pass allow_render=False to
+    force the cheap static path only.
+    """
+    if allow_render and is_spa_domain(url):
+        # No point fetching static HTML we know will be an empty shell.
+        return _render(url, max_chars, "known JavaScript-rendered site")
+
     try:
         html = _fetch(url)
-        parser = _TextExtractor()
-        parser.feed(html)
-        text = "\n".join(parser.chunks)
-        truncated = len(text) > max_chars
+    except urllib.error.HTTPError as e:
+        # A 404/403 is the single most useful signal when checking whether a
+        # page exists. Reporting it as a bare exception string buried the fact.
         return {
-            "status": "ok",
+            "error": f"HTTP {e.code} {e.reason}",
+            "http_status": e.code,
             "url": url,
-            "title": re.sub(r"\s+", " ", parser.title).strip(),
-            "text": text[:max_chars],
-            "truncated": truncated,
+            "exists": False if e.code == 404 else None,
         }
     except Exception as e:
         return {"error": str(e), "url": url}
+
+    parser = _TextExtractor()
+    parser.feed(html)
+    text = "\n".join(parser.chunks)
+    title = re.sub(r"\s+", " ", parser.title).strip()
+
+    # A JS-rendered page (Instagram, X, most SPAs) returns 200 with an empty
+    # shell. Reporting that as {"status": "ok", "text": ""} is worse than an
+    # error: the model sees success, has no content, and fills the gap by
+    # inventing one. Say plainly that nothing was readable.
+    if len(text.strip()) < MIN_USEFUL_CHARS:
+        # Static HTML had nothing in it. Render it rather than reporting a
+        # dead end — this is the common case for any modern framework, not
+        # just the domains on the known list.
+        if allow_render:
+            rendered = _render(url, max_chars, "static HTML had no readable text")
+            if rendered.get("status") == "ok":
+                return rendered
+            return {**rendered, "html_bytes": len(html), "title": title or rendered.get("title", "")}
+        return {
+            "error": (
+                "Fetched the page but found no readable text — it is rendered by "
+                "JavaScript, or behind a login or bot wall. Do NOT guess what the "
+                "page said; report that it could not be read."
+            ),
+            "url": url,
+            "title": title,
+            "http_status": 200,
+            "readable": False,
+            "needs_rendering": True,
+        }
+
+    truncated = len(text) > max_chars
+    return {
+        "status": "ok",
+        "url": url,
+        "title": title,
+        "text": text[:max_chars],
+        "truncated": truncated,
+        "readable": True,
+        "via": "static-html",
+    }
 
 
 def fetch_data(url: str, method: str = "GET", headers: dict | None = None, body: dict | None = None) -> dict:

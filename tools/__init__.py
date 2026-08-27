@@ -331,6 +331,33 @@ TOOL_DEFINITIONS: list[dict] = [
         },
     },
 
+    # ── Date and time ─────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "date_time",
+            "description": (
+                "Get the current date and time. Call this for ANY question about "
+                "today's date, the day of the week, the current time, or how long "
+                "until/since something — you have no clock of your own and your "
+                "training data is stale, so never answer these from memory. "
+                "Defaults to the user's own region; pass a city, country, or IANA "
+                "timezone for somewhere else."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City, country, or IANA timezone (e.g. 'Tokyo', 'Europe/London'). Omit for the user's local region.",
+                    },
+                    "format": {"type": "string", "description": "Optional strftime pattern for an extra formatted field."},
+                },
+                "required": [],
+            },
+        },
+    },
+
     # ── Web search / scraping ─────────────────────────────────
     {
         "type": "function",
@@ -360,9 +387,13 @@ TOOL_DEFINITIONS: list[dict] = [
         "function": {
             "name": "scrape_url",
             "description": (
-                "Fetch a URL and return its readable text content (HTML stripped). "
-                "Use this to read a page in full — typically on a url returned by "
-                "web_search, or any link the user gives you."
+                "Read a web page and return its text. Use this on a url from "
+                "web_search, or any link the user gives you. It handles "
+                "JavaScript-rendered sites (Instagram, X, Reddit, most modern apps) "
+                "automatically by rendering them in a headless browser, so you do "
+                "not need to reach for the browser_* tools yourself. If it returns "
+                "an error saying the page could not be read, report that plainly — "
+                "never guess or invent what the page contained."
             ),
             "parameters": {
                 "type": "object",
@@ -504,6 +535,58 @@ TOOL_DEFINITIONS: list[dict] = [
                 "properties": {"key": {"type": "string"}},
                 "required": ["key"],
             },
+        },
+    },
+
+    # ── Sandbox (staging + verify + promote) ──────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "sandbox_status",
+            "description": (
+                "Show what you have staged in this run's sandbox: the files changed, "
+                "whether tests have passed, and what confinement is active. Your "
+                "write_file/edit_file/append_file calls do NOT touch the user's real "
+                "files — they are staged here until you verify and promote."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sandbox_verify",
+            "description": (
+                "Run the project's tests against your staged changes, inside the "
+                "sandbox. Call this after editing and before sandbox_promote — "
+                "promotion is refused until the tests pass. Pass `command` only to "
+                "override the auto-detected test command."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string", "description": "Test command to run (optional)"}},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sandbox_promote",
+            "description": (
+                "Copy your verified staged changes into the user's real files. This "
+                "is the only tool that writes outside the sandbox. Requires a passing "
+                "sandbox_verify first; a .qh.bak copy is kept of anything overwritten."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sandbox_discard",
+            "description": "Throw away every staged change in this run's sandbox without applying any of it.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
 
@@ -685,6 +768,9 @@ def execute_tool(name: str, args: dict[str, Any]) -> Any:
             return find_files(**args)
 
         # Web tools
+        elif name == "date_time":
+            from tools.datetime_tool import get_datetime
+            return get_datetime(**args)
         elif name == "web_search":
             from tools.web import web_search
             return web_search(**args)
@@ -707,6 +793,26 @@ def execute_tool(name: str, args: dict[str, Any]) -> Any:
             return gh_get_file(**args)
 
         # Web tools (generic API access)
+        elif name == "sandbox_status":
+            from tools.sandbox import get_sandbox
+            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"), create=False)
+            return sandbox.summary() if sandbox else {"error": "no sandbox for this run"}
+        elif name == "sandbox_verify":
+            from tools.sandbox import get_sandbox
+            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"), create=False)
+            if not sandbox:
+                return {"error": "no sandbox for this run — nothing staged yet"}
+            return sandbox.verify(args.get("command"))
+        elif name == "sandbox_promote":
+            from tools.sandbox import get_sandbox
+            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"), create=False)
+            if not sandbox:
+                return {"error": "no sandbox for this run — nothing staged to promote"}
+            return sandbox.promote(force=bool(args.get("force")))
+        elif name == "sandbox_discard":
+            from tools.sandbox import get_sandbox
+            sandbox = get_sandbox(args.get("run_id", ""), args.get("cwd"), create=False)
+            return sandbox.discard() if sandbox else {"status": "ok", "discarded": 0}
         elif name == "fetch_data":
             from tools.web import fetch_data
             return fetch_data(**args)

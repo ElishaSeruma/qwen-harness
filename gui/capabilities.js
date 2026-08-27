@@ -14,7 +14,13 @@ async function readJsonResponse(res, fallback) {
     // Broadcast for the global helper-toast system (app.js listens) so every
     // API failure surfaces a toast with a what-to-do suggestion, without each
     // call site needing to remember to show one.
-    window.dispatchEvent(new CustomEvent('qh-api-error', { detail: { message: err.message, status: res.status } }));
+    //
+    // A 409 approval_required is NOT a failure — it is the server correctly
+    // asking permission, and the caller is about to show a dialog for it.
+    // Toasting it threw an error in your face before you had decided anything.
+    if (!data.approval_required) {
+      window.dispatchEvent(new CustomEvent('qh-api-error', { detail: { message: err.message, status: res.status } }));
+    }
     throw err;
   }
   return data;
@@ -162,6 +168,54 @@ export async function apiRunCancel(runId) {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ run_id: runId }),
   });
   return readJsonResponse(res, `run cancel failed (${res.status})`);
+}
+export async function apiRunEvents(runId, after = 0) {
+  const res = await fetch(`${API}/api/runs/events?run_id=${encodeURIComponent(runId)}&after=${after}`, { cache: 'no-store' });
+  return readJsonResponse(res, `run events failed (${res.status})`);
+}
+export async function apiContextPlan() {
+  const res = await fetch(`${API}/api/context/plan`, { cache: 'no-store' });
+  return readJsonResponse(res, `context plan failed (${res.status})`);
+}
+export async function apiAgentsGet() {
+  const res = await fetch(`${API}/api/agents`, { cache: 'no-store' });
+  return readJsonResponse(res, `agents load failed (${res.status})`);
+}
+export async function apiAgentsSave(payload) {
+  const res = await fetch(`${API}/api/agents/save`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `agents save failed (${res.status})`);
+}
+export async function apiProfileGet() {
+  const res = await fetch(`${API}/api/profile`, { cache: 'no-store' });
+  return readJsonResponse(res, `profile load failed (${res.status})`);
+}
+export async function apiProfileSave(profile) {
+  const res = await fetch(`${API}/api/profile/save`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(profile),
+  });
+  return readJsonResponse(res, `profile save failed (${res.status})`);
+}
+export async function apiRateMessage(payload) {
+  const res = await fetch(`${API}/api/feedback/rate`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  return readJsonResponse(res, `rating failed (${res.status})`);
+}
+export async function apiFeedbackSummary() {
+  const res = await fetch(`${API}/api/feedback/summary`, { cache: 'no-store' });
+  return readJsonResponse(res, `feedback summary failed (${res.status})`);
+}
+export async function apiFeedbackExport(kind = 'pairs') {
+  const res = await fetch(`${API}/api/feedback/export`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind }),
+  });
+  return readJsonResponse(res, `export failed (${res.status})`);
+}
+export async function apiRunsClear() {
+  const res = await fetch(`${API}/api/runs/clear`, { method: 'POST' });
+  return readJsonResponse(res, `clear activity failed (${res.status})`);
 }
 export async function apiRunRetry(runId) {
   const res = await fetch(`${API}/api/runs/retry`, {

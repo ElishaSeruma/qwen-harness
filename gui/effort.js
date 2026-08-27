@@ -1,8 +1,15 @@
+// Effort now buys TIME and ITERATIONS, not tokens.
+//
+// `maxTokens` is gone as a per-level knob: on ~7 tok/s hardware it only ever
+// truncated a long reply mid-sentence, and the worst-case totals it implied
+// (Deep = 4.4 hours) meant it bounded nothing real. A wall-clock budget says
+// the same thing in the unit you would actually choose, and `toolIterations`
+// is what stops a loop — a token cap never could.
 export const EFFORT_LEVELS = {
-  1: { name: 'Quick', detail: 'Direct response', maxTokens: 1024, toolIterations: 6, think: false, temperature: 0.45 },
-  2: { name: 'Focus', detail: 'Careful execution', maxTokens: 2048, toolIterations: 10, think: false, temperature: 0.55 },
-  3: { name: 'Deep', detail: 'Plan and verify', maxTokens: 4096, toolIterations: 14, think: true, temperature: 0.5 },
-  4: { name: 'Max', detail: 'Maximum rigor', maxTokens: 6144, toolIterations: 18, think: true, temperature: 0.4 },
+  1: { name: 'Quick', detail: 'Direct response',   budgetMs:  2 * 60_000, toolIterations: 6,  think: false, temperature: 0.45 },
+  2: { name: 'Focus', detail: 'Careful execution', budgetMs:  5 * 60_000, toolIterations: 10, think: false, temperature: 0.55 },
+  3: { name: 'Deep',  detail: 'Plan and verify',   budgetMs: 12 * 60_000, toolIterations: 14, think: true,  temperature: 0.5 },
+  4: { name: 'Max',   detail: 'Maximum rigor',     budgetMs: 25 * 60_000, toolIterations: 18, think: true,  temperature: 0.4 },
 };
 
 // Prompts that explicitly ask for tool work — "search the web for X", "use the

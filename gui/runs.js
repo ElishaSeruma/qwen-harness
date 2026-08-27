@@ -1,5 +1,5 @@
 import {
-  apiRunCancel, apiRunCreate, apiRunEvent, apiRuns, apiRunUpdate,
+  apiRunCancel, apiRunCreate, apiRunEvent, apiRunEvents, apiRuns, apiRunsClear, apiRunUpdate,
 } from './capabilities.js';
 
 
@@ -55,6 +55,21 @@ export async function cancelRun(runId) {
   const response = await apiRunCancel(runId);
   broadcast('qh-run-changed', response);
   return response.run;
+}
+
+/**
+ * Full event log for one run. The list endpoint deliberately strips `events`
+ * (40 runs x up to 500 events each), so the audit trail fetches on expand.
+ */
+export async function loadRunEvents(runId) {
+  return (await apiRunEvents(runId, 0)).events || [];
+}
+
+/** Drops settled runs from history. In-flight runs are always kept. */
+export async function clearFinishedRuns() {
+  const result = await apiRunsClear();
+  broadcast('qh-run-changed', {});
+  return result;
 }
 
 export function controllerForRun(runId) {

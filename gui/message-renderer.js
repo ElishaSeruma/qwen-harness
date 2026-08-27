@@ -88,6 +88,23 @@ export function createMessageActions(entry) {
     add('✎', 'edit', 'Edit prompt');
   } else {
     add('⧉', 'copy', 'Copy response');
+    // Ratings feed tools/feedback.py: they condition later prompts and build a
+    // finetuning dataset. Three levels, because "good" and "exactly this" are
+    // genuinely different signals and collapsing them loses the useful one.
+    const rate = (icon, value, label) => {
+      const button = document.createElement('button');
+      button.type = 'button'; button.textContent = icon; button.title = label;
+      button.className = 'rate-button'; button.dataset.rating = String(value);
+      button.setAttribute('aria-label', label);
+      button.setAttribute('aria-pressed', 'false');
+      button.addEventListener('click', () => window.dispatchEvent(new CustomEvent('qh-rate-message', {
+        detail: { rating: value, entry, source: button, group: actions },
+      })));
+      actions.append(button);
+    };
+    rate('👎', -1, 'Dislike — this response was wrong or unhelpful');
+    rate('👍', 1, 'Like — this response was good');
+    rate('❤️', 2, 'Love — more responses exactly like this');
   }
   return actions;
 }

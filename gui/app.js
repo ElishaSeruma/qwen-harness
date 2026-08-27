@@ -7,9 +7,12 @@
 import { renderFileTree, withPaths } from './filetree.js';
 import { invalidateSkillDefs, runAgentTurn } from './agent-loop.js';
 import { createActivityIndicator } from './activity.js';
+import { buildAuditTrail, currentActivityLine, DONE_TASK_STATES } from './run-audit.js';
+import { createProcessTranscript } from './process-transcript.js';
+import * as metrics from './metrics.js';
 import { mountToolsDrawer } from './tools-panel.js';
 import { createMessageActions, renderMarkdown } from './message-renderer.js';
-import { beginRun, cancelRun, emitRunEvent, failRun, finishRun, listRuns, updateRun } from './runs.js';
+import { beginRun, cancelRun, clearFinishedRuns, emitRunEvent, failRun, finishRun, listRuns, loadRunEvents, updateRun } from './runs.js';
 import { createTaskPlan, executeTaskGraph } from './orchestration.js';
 import { escalateEffort, getEffort, lockEffort, mountEffortGauge } from './effort.js';
 import {
@@ -25,6 +28,8 @@ import {
   apiProjectIndex, apiProjectSearch, apiProjectPublishGithub, apiProjectGitAction, apiProjectDelete, apiProjectSettings,
   apiWebSearch, apiWebScrape, apiGithubStatus, apiGithubConnect, apiGithubDisconnect, apiGithubRepos,
   apiSkillCreate, apiSkillsList, apiToolsList,
+  apiRateMessage, apiFeedbackSummary, apiProfileGet, apiProfileSave,
+  apiAgentsGet, apiAgentsSave,
   apiSupabaseStatus, apiSupabaseConnect, apiSupabaseDisconnect,
   isDesktopClient, desktopChooseDirectory, desktopChooseFile,
   getDirectory, setDirectory, getHotphrases, setHotphrases,
@@ -92,9 +97,21 @@ function applyInputDefaults(el) {
 function wireAutoResize(el) {
   if (el._qhAutoResizeWired) return;
   el._qhAutoResizeWired = true;
-  const resize = () => { el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight, 320)}px`; };
+  // The cap is viewport-relative: with the composer docked at the bottom, a
+  // flat 320px ceiling could swallow most of a short window and squeeze the
+  // transcript to nothing.
+  const resize = () => {
+    el.style.height = 'auto';
+    const cap = Math.max(96, Math.min(320, Math.round(window.innerHeight * 0.32)));
+    el.style.height = `${Math.min(el.scrollHeight, cap)}px`;
+  };
   resize();
   el.addEventListener('input', resize);
+  window.addEventListener('resize', resize);
+  // The first measurement can land before webfonts settle, which used to leave
+  // the textarea stuck at the cap for the whole session.
+  document.fonts?.ready?.then(resize).catch(() => {});
+  requestAnimationFrame(resize);
 }
 function applyInputEnhancements(root) {
   if (root.matches?.('input, textarea')) applyInputDefaults(root);
@@ -119,6 +136,7 @@ const ERROR_SUGGESTIONS = [
   [/does not support tools/i, 'This model can\'t call tools. Toggle "Agent tools" off for it, or switch to a tool-capable model like qwen3:4b.'],
   [/supabase is not connected/i, 'Connect Supabase first: Connectors → Supabase, paste your Project URL + service_role key.'],
   [/github is not connected|bad credentials/i, 'Connect GitHub first: Connectors → GitHub, paste a Personal Access Token (repo scope).'],
+  [/cannot push|write access to repository|contents: read and write/i, 'Reconnect GitHub with a classic PAT using repo scope, or a fine-grained PAT with Contents: Read and write for this repository, then retry Push.'],
   [/timed out/i, 'The command exceeded the 30s limit. Run long jobs in a real terminal, or split the work into smaller commands.'],
   [/file too large/i, 'This file is over the 3MB read cap — open it in a dedicated editor instead.'],
   [/pyautogui/i, 'The computer-control tools need pyautogui: run `pip3 install --break-system-packages pyautogui`.'],
@@ -179,14 +197,82 @@ function persistTurn(chatId, userText, assistantText, title) {
 // Honours the Auto-approve toggle and per-scope session grants so an agent
 // can chain many edits without a modal per step, while still asking once
 // for anything not yet trusted this session.
-async function handleApprovalRequest({ tool, scope, prompt }) {
+/**
+ * Permission prompt. A real in-app dialog, not window.confirm(), so it looks
+ * the same in a browser and in the Mac app and can show what is actually being
+ * asked for — confirm() can only render one blob of unstyled text, and its
+ * two buttons forced "allow everything in this scope forever" onto the same
+ * click as "yes, do this one thing".
+ *
+ * Fails closed: Escape, the backdrop, and the close button all deny.
+ */
+function requestPermission({ tool, scope, args }) {
+  const key = scope || tool;
+  return new Promise((resolve) => {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'permission-dialog';
+
+    const head = document.createElement('div');
+    head.className = 'permission-head';
+    const eyebrow = document.createElement('span');
+    eyebrow.className = 'eyebrow';
+    eyebrow.textContent = 'Permission needed';
+    const title = document.createElement('h2');
+    title.textContent = `Allow ${key}?`;
+    head.append(eyebrow, title);
+
+    const body = document.createElement('div');
+    body.className = 'permission-body';
+    const toolRow = document.createElement('p');
+    toolRow.className = 'permission-tool';
+    toolRow.append(Object.assign(document.createElement('code'), { textContent: tool }));
+    body.append(toolRow);
+
+    if (args && Object.keys(args).length) {
+      const pre = document.createElement('pre');
+      pre.className = 'permission-args';
+      pre.textContent = JSON.stringify(args, null, 2).slice(0, 2000);
+      body.append(pre);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'permission-actions';
+    const settle = (value, grantScope = false) => {
+      if (grantScope) approveScopeForSession(key);
+      dialog.close();
+      dialog.remove();
+      resolve(value);
+    };
+    const deny = document.createElement('button');
+    deny.type = 'button'; deny.className = 'mode-button mode-button-danger'; deny.textContent = 'Deny';
+    deny.addEventListener('click', () => settle(false));
+    const once = document.createElement('button');
+    once.type = 'button'; once.className = 'mode-button'; once.textContent = 'Allow once';
+    once.addEventListener('click', () => settle(true));
+    const always = document.createElement('button');
+    always.type = 'button'; always.className = 'send-button'; always.textContent = 'Allow for session';
+    always.title = `Allow this and everything else in "${key}" until this tab closes`;
+    always.addEventListener('click', () => settle(true, true));
+    actions.append(deny, once, always);
+
+    const note = document.createElement('p');
+    note.className = 'permission-note';
+    note.textContent = 'Session grants live in memory only and are forgotten when this tab closes.';
+
+    dialog.append(head, body, actions, note);
+    // Escape fires 'cancel'; treat it, and any other close, as a denial.
+    dialog.addEventListener('cancel', (e) => { e.preventDefault(); settle(false); });
+    dialog.addEventListener('click', (e) => { if (e.target === dialog) settle(false); });
+    document.body.append(dialog);
+    dialog.showModal();
+    once.focus();
+  });
+}
+
+async function handleApprovalRequest({ tool, scope, args }) {
   const key = scope || tool;
   if (isScopeApproved(key)) return true;
-  const choice = window.confirm(
-    `${prompt}\n\nOK = allow this and everything else in "${key}" for this session.\nCancel = deny.`
-  );
-  if (choice) approveScopeForSession(key);
-  return choice;
+  return requestPermission({ tool, scope: key, args });
 }
 
 window.addEventListener('qh-api-error', (e) => {
@@ -213,11 +299,25 @@ function makeAgent(slug, name, modelKey, nickname = null) {
     handle: null, stageHandle: null, hubHandle: null, greetingHandle: null, transcript: [],
   };
 }
-function persistAgents() {
-  localStorage.setItem(AGENTS_KEY, JSON.stringify({
+function agentRosterPayload() {
+  return {
     agentSeq, activeAgentId,
+    updated_at: Date.now() / 1000,
     agents: agents.map(a => ({ id: a.id, name: a.name, slug: a.slug, nickname: a.nickname, modelKey: a.modelKey, state: 'idle' })),
-  }));
+  };
+}
+function persistAgents({ sync = true, force = false } = {}) {
+  const payload = agentRosterPayload();
+  localStorage.setItem(AGENTS_KEY, JSON.stringify(payload));
+  // Also push to the server, which is what keeps the Mac app and a browser tab
+  // showing the SAME agents. localStorage is per-origin, so on its own the two
+  // drift until they look like different applications.
+  if (sync) {
+    apiAgentsSave({
+      agents: payload.agents, agent_seq: payload.agentSeq,
+      active_agent_id: payload.activeAgentId, updated_at: payload.updated_at, force,
+    }).catch(() => { /* offline: localStorage still holds it, sync on next change */ });
+  }
 }
 function loadAgents() {
   try {
@@ -240,6 +340,40 @@ const agents = restored ? restored.agents : [
   makeAgent('grok-bot', 'critic', modelsConfig.active),
 ];
 let activeAgentId = (restored && agents.some(a => a.id === restored.activeAgentId)) ? restored.activeAgentId : agents[0].id;
+
+// Adopt the shared roster if the server's copy is newer than this browser's.
+// Whichever device you actually edited last wins, so the Mac app and a browser
+// converge instead of each insisting on its own set of avatars.
+const localRosterAt = (() => {
+  try { return JSON.parse(localStorage.getItem(AGENTS_KEY) || '{}').updated_at || 0; }
+  catch { return 0; }
+})();
+async function syncAgentRoster() {
+  let remote;
+  try { remote = await apiAgentsGet(); } catch { return; }
+  if (!remote.has_roster) {
+    // Nothing stored yet — seed it from this device.
+    persistAgents();
+    return;
+  }
+  if ((remote.updated_at || 0) <= localRosterAt) {
+    // This device is newer; publish it.
+    if ((remote.updated_at || 0) < localRosterAt) persistAgents();
+    return;
+  }
+  agentSeq = remote.agent_seq || remote.agents.length;
+  agents.splice(0, agents.length, ...remote.agents.map(a => ({
+    ...makeAgent(a.slug, a.name, a.modelKey, a.nickname ?? null), id: a.id, state: 'idle',
+  })));
+  if (remote.active_agent_id && agents.some(a => a.id === remote.active_agent_id)) {
+    activeAgentId = remote.active_agent_id;
+  }
+  localStorage.setItem(AGENTS_KEY, JSON.stringify({
+    agentSeq, activeAgentId, updated_at: remote.updated_at,
+    agents: remote.agents,
+  }));
+  window.dispatchEvent(new CustomEvent('qh-agents-synced'));
+}
 
 // ── durable activity drawer ────────────────────────────────────────────
 const ACTIVE_RUN_STATES = new Set(['queued', 'planning', 'running', 'thinking', 'working', 'verifying', 'waiting_permission']);
@@ -330,6 +464,36 @@ async function refreshActivity() {
   renderActivityDrawer(runs);
 }
 
+// Remembering which audit trails are open keeps them from snapping shut on
+// every re-render — and re-renders happen on every streamed run event.
+const expandedAudits = new Set();
+// Cleared alongside the runs themselves; a settled run's log never changes.
+const auditEventCache = new Map();
+
+function renderAuditSteps(list, trail) {
+  list.replaceChildren();
+  if (!trail.length) {
+    list.append(Object.assign(document.createElement('li'), { textContent: 'No recorded steps.' }));
+    return;
+  }
+  for (const step of trail) {
+    const item = document.createElement('li');
+    item.dataset.kind = step.kind;
+    const text = document.createElement('span'); text.textContent = step.text;
+    item.append(text);
+    if (step.at) { const when = document.createElement('small'); when.textContent = shortClock(step.at); item.append(when); }
+    list.append(item);
+  }
+}
+function agentNameFor(agentId) {
+  if (!agentId) return '';
+  return agents.find(a => a.id === agentId)?.name || agentId;
+}
+function shortClock(iso) {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
 async function renderActivityDrawer(prefetched = null) {
   const list = $('#activity-list');
   if (!list) return;
@@ -345,18 +509,68 @@ async function renderActivityDrawer(prefetched = null) {
   for (const run of runs) {
     const card = document.createElement('article'); card.className = 'run-card'; card.dataset.runId = run.id;
     const head = document.createElement('div'); head.className = 'run-card-head';
-    head.append(createActivityIndicator(run.status, { size: 20, detail: run.last_event_type || run.events?.at(-1)?.type || run.surface }));
+    head.append(createActivityIndicator(run.status, { size: 20, detail: currentActivityLine(run, agentNameFor) }));
     const effortNames = ['Quick', 'Focus', 'Deep', 'Max'];
     const meta = document.createElement('span'); meta.className = 'run-card-meta'; meta.textContent = `${effortNames[(run.effort_level || 1) - 1]} ${run.effort_level || 1}/4 · #${run.attempt || 1} · ${relativeRunTime(run.updated_at)}`; head.append(meta);
     const instruction = document.createElement('p'); instruction.className = 'run-card-instruction'; instruction.textContent = run.instruction || '(no instruction)';
+
+    const tasks = run.tasks || [];
     const taskList = document.createElement('div'); taskList.className = 'run-task-list';
-    for (const task of run.tasks || []) {
+    if (tasks.length) {
+      const doneCount = tasks.filter(task => task.status === 'completed').length;
+      const progress = document.createElement('div'); progress.className = 'run-task-progress';
+      progress.textContent = `Subtasks ${doneCount}/${tasks.length}`;
+      taskList.append(progress);
+    }
+    // A settled run cannot still have work in progress, whatever the stored
+    // task status says. Rendering defensively means old records repair
+    // visually too, not just the ones written since the store was fixed.
+    const runSettled = !ACTIVE_RUN_STATES.has(run.status);
+    for (const task of tasks) {
       const row = document.createElement('div'); row.className = 'run-task-row';
-      row.append(createActivityIndicator(task.status || 'queued', { size: 14, label: false }));
+      const taskStatus = runSettled && !DONE_TASK_STATES.has(task.status) ? run.status : task.status;
+      row.dataset.status = taskStatus || 'queued';
+      // A completed subtask gets a plain checkmark rather than a spinner ring:
+      // at a glance you want "done" to be unmistakable from "still going".
+      const mark = document.createElement('span'); mark.className = 'run-task-mark';
+      if (taskStatus === 'completed') mark.textContent = '✓';
+      else if (runSettled || DONE_TASK_STATES.has(taskStatus)) mark.textContent = '✕';
+      else mark.append(createActivityIndicator(taskStatus || 'queued', { size: 14, label: false }));
+      row.append(mark);
       const copy = document.createElement('span'); copy.textContent = task.title;
-      const owner = document.createElement('small'); owner.textContent = task.agent_id || task.role || '';
+      const owner = document.createElement('small'); owner.textContent = agentNameFor(task.agent_id) || task.role || '';
       row.append(copy, owner); taskList.append(row);
     }
+
+    // The audit trail: what each agent actually did, in order. Collapsed by
+    // default, and its events are fetched on expand — /api/runs deliberately
+    // strips `events`, so shipping 40 full logs to draw a closed list would be
+    // pure waste. Expansion is remembered per run so a streamed re-render
+    // doesn't snap it shut under you.
+    let auditBlock = null;
+    if (run.event_count) {
+      auditBlock = document.createElement('details'); auditBlock.className = 'run-audit';
+      const summary = document.createElement('summary');
+      summary.textContent = `Audit trail · ${run.event_count} event${run.event_count === 1 ? '' : 's'}`;
+      const steps = document.createElement('ol'); steps.className = 'run-audit-steps';
+      auditBlock.append(summary, steps);
+      auditBlock.open = expandedAudits.has(run.id);
+      const fill = async () => {
+        try {
+          const events = auditEventCache.get(run.id) || await loadRunEvents(run.id);
+          auditEventCache.set(run.id, events);
+          renderAuditSteps(steps, buildAuditTrail({ ...run, events }, agentNameFor));
+        } catch (err) {
+          steps.replaceChildren(Object.assign(document.createElement('li'), { textContent: `Couldn't load: ${err.message}` }));
+        }
+      };
+      if (auditBlock.open) fill();
+      auditBlock.addEventListener('toggle', () => {
+        if (auditBlock.open) { expandedAudits.add(run.id); fill(); }
+        else expandedAudits.delete(run.id);
+      });
+    }
+
     const footer = document.createElement('div'); footer.className = 'run-card-actions';
     if (ACTIVE_RUN_STATES.has(run.status)) {
       const stop = document.createElement('button'); stop.type = 'button'; stop.textContent = 'Stop';
@@ -367,8 +581,47 @@ async function renderActivityDrawer(prefetched = null) {
       retry.addEventListener('click', () => window.dispatchEvent(new CustomEvent('qh-retry-run', { detail: run })));
       footer.append(retry);
     }
-    card.append(head, instruction); if (taskList.childElementCount) card.append(taskList); card.append(footer); list.append(card);
+    card.append(head, instruction);
+    if (taskList.childElementCount) card.append(taskList);
+    if (auditBlock) card.append(auditBlock);
+    card.append(footer);
+    list.append(card);
   }
+  renderActivityClearButton(list, runs);
+}
+
+/**
+ * Clear sits at the end of the list and only ever removes settled runs —
+ * anything still in flight is kept, so it can't be used to lose work.
+ */
+function renderActivityClearButton(list, runs) {
+  const settled = runs.filter(run => !ACTIVE_RUN_STATES.has(run.status)).length;
+  const active = runs.length - settled;
+  if (!settled) return;
+  const wrap = document.createElement('div'); wrap.className = 'activity-clear-row';
+  const button = document.createElement('button');
+  button.type = 'button'; button.className = 'activity-clear';
+  button.textContent = `Clear ${settled} finished`;
+  button.title = active ? `${active} still running — those are kept` : 'Clears finished runs only';
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      await clearFinishedRuns();
+      expandedAudits.clear();
+      auditEventCache.clear();
+      await renderActivityDrawer();
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = `Couldn't clear: ${err.message}`;
+    }
+  });
+  wrap.append(button);
+  if (active) {
+    const note = document.createElement('small');
+    note.textContent = `${active} still running — kept`;
+    wrap.append(note);
+  }
+  list.append(wrap);
 }
 
 function setActivityDrawer(open) {
@@ -376,7 +629,71 @@ function setActivityDrawer(open) {
   $('#activity-toggle').setAttribute('aria-expanded', String(open));
   if (open) renderActivityDrawer();
 }
+// ── output ratings ─────────────────────────────────────────────────────
+// The last prompt that produced each response, so a rating carries the pair
+// rather than a naked answer — a preference is only meaningful against what
+// was asked.
+const lastPromptFor = new Map();
+window.addEventListener('qh-rate-message', async (event) => {
+  const { rating, entry, source, group } = event.detail || {};
+  if (!entry) return;
+  const already = source.getAttribute('aria-pressed') === 'true';
+  group?.querySelectorAll('.rate-button').forEach(b => b.setAttribute('aria-pressed', 'false'));
+  // Assign the id up front. Deriving it at un-rate time meant an unrated
+  // message sent message_id: null, which the server could not act on.
+  entry.rating_id = entry.rating_id
+    || `${entry.created_at || Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    if (already) {
+      // Clicking the active rating clears it — a mis-click must be undoable.
+      await apiRateMessage({ message_id: entry.rating_id, rating: null });
+      refreshFeedbackBadge();
+      return;
+    }
+    source.setAttribute('aria-pressed', 'true');
+    await apiRateMessage({
+      message_id: entry.rating_id,
+      rating,
+      response: entry.text || '',
+      prompt: lastPromptFor.get(currentSurface()) || '',
+      model: modelsConfig.active,
+      surface: currentSurface(),
+      effort: entry.effort_level || null,
+      tools_used: entry.tools_used || [],
+    });
+    window.dispatchEvent(new CustomEvent('qh-rating-changed'));
+    refreshFeedbackBadge();
+  } catch (err) {
+    source.setAttribute('aria-pressed', 'false');
+    const message = err?.status === 404 || /not found/i.test(err?.message || '')
+      ? 'Ratings need a newer server than the one running — restart the app.'
+      : `Rating failed: ${err?.message || err}`;
+    window.dispatchEvent(new CustomEvent('qh-api-error', { detail: { message } }));
+    console.warn('[feedback]', message);
+  }
+});
+
+async function refreshFeedbackBadge() {
+  const badge = $('#feedback-count');
+  if (!badge) return;
+  try {
+    const data = await apiFeedbackSummary();
+    badge.textContent = String(data.total || 0);
+    badge.parentElement?.setAttribute('data-learning', data.guidance_active ? 'on' : 'off');
+    badge.parentElement.title = data.guidance_active
+      ? `Learning from your ratings:\n${data.guidance}`
+      : `${data.total || 0} ratings. Needs ${data.min_samples_per_side} good and ${data.min_samples_per_side} bad before it adapts.`;
+  } catch { /* server down; leave the badge as-is */ }
+}
+refreshFeedbackBadge();
+
 mountToolsDrawer({ getModelKey: () => modelsConfig.active });
+metrics.mountMetricsPanel();
+// A run that ends without its panel (cancelled, or closed twice) would leave
+// the in-flight counter high. When no surface has an active run, it is zero.
+window.addEventListener('qh-run-changed', () => {
+  if (surfaceActiveRuns.size === 0) metrics.clearInFlight();
+});
 $('#activity-toggle').addEventListener('click', () => setActivityDrawer($('#activity-drawer').hidden));
 $('#activity-close').addEventListener('click', () => setActivityDrawer(false));
 // Run events stream in fast during inference; without a trailing debounce the
@@ -440,12 +757,40 @@ function stampEntry(entry) {
   return entry;
 }
 
+// A broadcast prompt comes from the user, not from any one agent, so it gets a
+// plain "You" label — agentBadge would render an empty avatar box and an
+// idle-state spinner for a speaker that isn't an agent.
+function userBadge(count) {
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-agent-badge is-user';
+  const meta = document.createElement('div');
+  meta.className = 'chat-agent-meta';
+  const name = document.createElement('strong');
+  name.textContent = 'You';
+  meta.append(name);
+  if (count > 1) {
+    const to = document.createElement('span');
+    to.className = 'chat-agent-state';
+    to.textContent = `→ ${count} agents`;
+    meta.append(to);
+  }
+  wrap.append(meta);
+  return wrap;
+}
+
 function renderChatEntry(agent, entry, fallbackLabel = 'agent', surface = currentSurface()) {
   stampEntry(entry);
+  // An event with no renderable text used to produce an empty bordered box in
+  // the feed (approval_required did exactly this). Nothing to say, nothing to
+  // draw.
+  if (!entry.text && !['tool_call', 'tool_result'].includes(entry.type)) {
+    return document.createDocumentFragment();
+  }
   const wrap = document.createElement('div');
   wrap.className = 'chat-entry-wrap';
   wrap.dataset.surface = surface;
-  if (entry.type === 'user' || entry.type === 'assistant') wrap.append(agentBadge(agent, fallbackLabel));
+  if (entry.type === 'user' && !agent) wrap.append(userBadge(entry.recipients?.length || 0));
+  else if (entry.type === 'user' || entry.type === 'assistant') wrap.append(agentBadge(agent, fallbackLabel));
   const message = renderEntry(entry);
   if (entry.type === 'user' || entry.type === 'assistant') message.append(createMessageActions(entry));
   wrap.append(message);
@@ -498,6 +843,22 @@ function renderEntry(entry) {
   div.className = `msg msg-${entry.type === 'user' ? 'user' : 'assistant'}`;
   if (entry.role) { const role = document.createElement('span'); role.className = 'msg-role'; role.textContent = entry.role; div.append(role); }
   div.append(renderMarkdown(entry.text));
+  // A broadcast is one prompt with many readers — name them on the prompt
+  // rather than repeating the whole bubble once per agent.
+  if (entry.type === 'user' && entry.recipients?.length > 1) {
+    const to = document.createElement('div');
+    to.className = 'msg-recipients';
+    const label = document.createElement('span');
+    label.className = 'msg-recipients-label';
+    label.textContent = `Sent to ${entry.recipients.length} agents`;
+    to.append(label);
+    for (const name of entry.recipients) {
+      const chip = document.createElement('em');
+      chip.textContent = name;
+      to.append(chip);
+    }
+    div.append(to);
+  }
   return div;
 }
 
@@ -505,13 +866,16 @@ function updateStreamingMessage(container, agent, key, text, fallbackLabel = 'ag
   let wrap = container.querySelector(`.chat-entry-wrap[data-stream-key="${CSS.escape(key)}"]`);
   if (!wrap) {
     container.querySelector('.transcript-empty')?.remove();
+    if (container.id === 'home-feed') setHomeChatActive(true);
     wrap = document.createElement('div'); wrap.className = 'chat-entry-wrap is-streaming'; wrap.dataset.streamKey = key;
     wrap.append(agentBadge(agent, fallbackLabel));
     const message = document.createElement('div'); message.className = 'msg msg-assistant'; wrap.append(message);
     container.append(wrap);
   }
+  const pinned = isPinnedToBottom(container);
   wrap.querySelector('.msg').replaceChildren(renderMarkdown(text || ' '));
-  container.scrollTop = container.scrollHeight;
+  if (pinned) container.scrollTop = container.scrollHeight;
+  updateJumpButton(container);
 }
 
 function clearStreamingMessage(container, key) {
@@ -532,6 +896,7 @@ function currentSurface() {
   if (!$('#view-code').hidden) return 'code';
   if (!$('#view-hub').hidden) return 'hub';
   if (!$('#view-skills').hidden) return 'skills';
+  if (!$('#view-profile').hidden) return 'profile';
   return 'home';
 }
 
@@ -749,13 +1114,154 @@ async function renderHomeGreetingAvatars() {
 }
 $('#home-agent-target').addEventListener('change', renderHomeGreetingAvatars);
 
+// Autoscroll only while the reader is already at the bottom. Unconditionally
+// writing scrollTop (the old behaviour) yanked you back down mid-sentence
+// whenever you scrolled up to read an earlier reply.
+const SCROLL_PIN_SLACK = 64;
+
+// Scrolling up to re-read something shouldn't strand you: each feed gets a
+// "jump to latest" affordance that only exists while you're actually away
+// from the bottom, and reports how many messages arrived meanwhile.
+const jumpButtons = new WeakMap();
+function ensureFeedWrap(feed) {
+  const parent = feed.parentElement;
+  if (parent?.classList.contains('feed-wrap')) return parent;
+  const wrap = document.createElement('div');
+  wrap.className = 'feed-wrap';
+  parent.insertBefore(wrap, feed);
+  wrap.append(feed);
+  return wrap;
+}
+function ensureJumpButton(feed) {
+  let button = jumpButtons.get(feed);
+  if (button?.isConnected) return button;
+  button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'feed-jump';
+  button.hidden = true;
+  button.textContent = 'Jump to latest ↓';
+  // Direct assignment, not scrollTo({behavior:'smooth'}): the smooth variant is
+  // silently a no-op in some embedded webviews, which left the button dead.
+  button.addEventListener('click', () => {
+    feed.scrollTop = feed.scrollHeight;
+    updateJumpButton(feed);
+  });
+  // The button must be positioned against the feed's own box, not whatever
+  // container happens to hold it, so give every feed a relative wrapper.
+  ensureFeedWrap(feed).append(button);
+  feed.addEventListener('scroll', () => updateJumpButton(feed), { passive: true });
+  jumpButtons.set(feed, button);
+  return button;
+}
+function updateJumpButton(feed) {
+  if (!feed?.parentElement) return;
+  const button = ensureJumpButton(feed);
+  button.hidden = isPinnedToBottom(feed);
+}
+function isPinnedToBottom(feed) {
+  return feed.scrollHeight - feed.scrollTop - feed.clientHeight <= SCROLL_PIN_SLACK;
+}
+function appendToFeed(feed, node) {
+  const pinned = isPinnedToBottom(feed);
+  feed.append(node);
+  if (pinned) feed.scrollTop = feed.scrollHeight;
+  updateJumpButton(feed);
+  return node;
+}
+
+// Once the first message lands, the greeting collapses and the transcript
+// takes its space. The composer is docked at the bottom in both states, so it
+// never moves under the user between one prompt and the next.
+function setHomeChatActive(active) {
+  const view = $('#view-home');
+  if (view) view.dataset.chat = active ? 'active' : 'idle';
+}
+
 function homeFeedAppend(agentLabel, entry) {
   stampEntry(entry);
   const feed = $('#home-feed');
   feed.querySelector('.transcript-empty')?.remove();
+  setHomeChatActive(true);
   const agent = agents.find(a => a.name === agentLabel || a.id === agentLabel);
-  feed.append(renderChatEntry(agent, entry, agentLabel, 'home'));
-  feed.scrollTop = feed.scrollHeight;
+  appendToFeed(feed, renderChatEntry(agent, entry, agentLabel, 'home'));
+}
+
+/**
+ * One user bubble per send, however many agents it goes to.
+ * Broadcasting to five agents used to append five identical prompt bubbles,
+ * turning a one-word "help" into five screens of scroll. The recipients are
+ * named on the single bubble instead.
+ */
+function feedAppendUserPrompt(feed, entry, targets, surface) {
+  stampEntry(entry);
+  feed.querySelector('.transcript-empty')?.remove();
+  const solo = targets.length === 1 ? targets[0] : null;
+  const wrap = renderChatEntry(solo, { ...entry, recipients: targets.map(displayName) },
+    solo ? displayName(solo) : 'you', surface);
+  return appendToFeed(feed, wrap);
+}
+
+// A process panel per agent per run: created the moment the prompt is sent,
+// collapsed, and filled in live from the agent loop's events.
+const processPanels = new Map();
+function processKey(runId, agentId) { return `${runId}:${agentId || 'solo'}`; }
+
+function openProcessPanel(feed, runId, agent, label = 'Working', modelKey = null) {
+  const key = processKey(runId, agent?.id);
+  if (processPanels.has(key)) return processPanels.get(key);
+  metrics.turnStarted(modelKey || agent?.modelKey || modelsConfig.active);
+  const panel = createProcessTranscript({ agentName: agent ? displayName(agent) : null, label });
+  processPanels.set(key, panel);
+  feed.querySelector('.transcript-empty')?.remove();
+  appendToFeed(feed, panel.el);
+  return panel;
+}
+function processPanel(runId, agentId) { return processPanels.get(processKey(runId, agentId)) || null; }
+function closeProcessPanel(runId, agentId, { error = null, summary = null } = {}) {
+  const panel = processPanel(runId, agentId);
+  // Decrement BEFORE the early return, and only once per registered panel.
+  // Putting it after meant a turn that closed without a panel never
+  // decremented, and the panel showed "N working" forever.
+  if (panel) metrics.turnFinished();
+  if (!panel) return;
+  if (error) panel.fail(error); else panel.done(summary);
+  processPanels.delete(processKey(runId, agentId));
+}
+
+/** Feeds one agent-loop event into the metrics panel. */
+function recordMetricsEvent(ev) {
+  if (ev.type === 'tool_call') metrics.recordEvent('tool_call');
+  else if (ev.type === 'usage') metrics.recordUsage(ev.usage || { total_tokens: ev.totalTokens });
+  else if (ev.type === 'incomplete') metrics.recordEvent('incomplete');
+  else if (ev.type === 'approval_required') metrics.recordEvent('approval');
+  else if (ev.type === 'system' && ev.event === 'handoff') metrics.recordEvent('handoff', { from: ev.from, to: ev.to });
+  else if (ev.type === 'system' && ev.event === 'effort_escalated') metrics.recordEvent('escalation');
+  else if (ev.type === 'tool_result') {
+    try { if (JSON.parse(ev.text)?.error) metrics.recordEvent('tool_error'); } catch { /* non-JSON is fine */ }
+  }
+}
+
+/** Feeds one agent-loop event into its process panel. */
+function recordProcessEvent(runId, agentId, ev) {
+  // Metrics first, and unconditionally: they are per-session, so they must be
+  // recorded even for a run whose process panel has already been closed.
+  recordMetricsEvent(ev);
+  const panel = processPanel(runId, agentId);
+  if (!panel) return;
+  if (ev.type === 'incomplete') panel.incomplete(ev.reason, ev.thought);
+  else if (ev.type === 'reasoning') panel.reasoning(ev.text);
+  else if (ev.type === 'tool_call') {
+    const verify = ev.name === 'sandbox_verify' || ev.name === 'sandbox_promote';
+    panel.step({ kind: verify ? 'verify' : 'tool', name: ev.name, args: ev.args });
+  } else if (ev.type === 'tool_result') {
+    let ok = true;
+    try { ok = !JSON.parse(ev.text)?.error; } catch { /* non-JSON result is fine */ }
+    panel.step({ kind: 'result', text: ev.text, ok });
+  } else if (ev.type === 'system') {
+    panel.step({ kind: 'note', text: ev.text });
+  } else if (ev.type === 'approval_required') {
+    panel.step({ kind: 'note', text: `Waiting for permission: ${ev.scope || ev.tool}` });
+  }
 }
 
 function feedForSurface(surface) {
@@ -775,7 +1281,7 @@ function appendSurfaceEntry(surface, project, agent, entry) {
 async function runAutoOrchestration({ surface, instruction, project = null, modelKey, pool }) {
   if (await stopSurfaceRun(surface)) return;
   const { payload: effortPayload } = effortForPrompt(surface, instruction);
-  const cwd = project?.path || currentTreeRoot || getDirectory() || '.';
+  const cwd = project?.path || currentTreeRoot || effectiveWorkingDir() || '.';
   const context = project ? await projectDocsContext(project) : '';
   const { run, controller } = await beginRun({
     surface, instruction, project_id: project?.id || null, cwd, model_key: modelKey,
@@ -859,7 +1365,11 @@ async function sendHomeMessage() {
     input.value = ''; clearAttachments(); renderAttachmentChips();
     return runAutoOrchestration({ surface: 'home', instruction: fullText, project, modelKey, pool: agents });
   }
-  const cwd = project?.path || getDirectory() || '.';
+  // Explicit beats ambient: a working directory you set on this surface wins
+  // over whichever project happens to be active on the Projects page. The
+  // other way round, the Working dir button showed one path while the tools
+  // ran in another — the failure was invisible until you read a tool result.
+  const cwd = effectiveWorkingDir() || project?.path || '.';
   const { payload: effortPayload } = effortForPrompt('home', fullText);
   const { run, controller } = await beginRun({
     surface: 'home', instruction: fullText, project_id: project?.id || null,
@@ -870,10 +1380,18 @@ async function sendHomeMessage() {
   clearAttachments();
   renderAttachmentChips();
 
+  // One bubble in the feed, however many agents receive it. Each agent still
+  // gets the turn in its own transcript (that's its conversation history) —
+  // it's only the shared feed that must not repeat the prompt N times.
+  lastPromptFor.set('home', fullText);
+  feedAppendUserPrompt($('#home-feed'), { type: 'user', text: fullText }, targets, 'home');
+  setHomeChatActive(true);
   for (const agent of targets) {
-    const entry = stampEntry({ type: 'user', text: fullText });
-    homeFeedAppend(agent.name, entry);
-    appendEntry(agent, entry);
+    appendEntry(agent, stampEntry({ type: 'user', text: fullText }));
+    // The process panel goes up with the prompt, not when the first token
+    // arrives — the wait before a local model responds is exactly when you
+    // most want to see that something is happening.
+    openProcessPanel($('#home-feed'), run.id, agent, 'Working', modelKey);
     setAgentState(agent, 'listening');
   }
   await sleep(200);
@@ -886,6 +1404,7 @@ async function sendHomeMessage() {
     const chatId = await ensureChat(agent);
     const priorMessages = await buildPriorMessages(chatId);
     try {
+      let turnIncomplete = false;
       const reply = await runAgentTurn({
         modelKey, userText: fullText, priorMessages,
         cwd, signal: controller.signal, runId: run.id, toolProfile: 'home',
@@ -895,6 +1414,9 @@ async function sendHomeMessage() {
         onApprovalRequest: handleApprovalRequest,
       onEvent: (ev) => {
           if (ev.type === 'usage') {
+            // Metrics first: this branch returns early, and returning before
+            // recordProcessEvent meant the panel never saw a single token.
+            recordMetricsEvent(ev);
             trackUsageAndMaybeCompact(chatId, modelKey, ev.totalTokens, (prompt) =>
               runAgentTurn({ modelKey, userText: prompt, systemPrompt: 'You summarize conversations concisely.' })
             );
@@ -908,14 +1430,26 @@ async function sendHomeMessage() {
           }
           if (ev.type === 'tool_result') emitRunEvent(run.id, 'agent.tool.completed', { agent_id: agent.id });
           if (ev.type === 'approval_required') emitRunEvent(run.id, 'agent.waiting_permission', { agent_id: agent.id, tool: ev.tool, scope: ev.scope });
+          if (ev.type === 'incomplete') turnIncomplete = true;
+          recordProcessEvent(run.id, agent.id, ev);
+          // Tool chatter belongs in the process panel, not as loose bubbles in
+          // the feed — that was the wall of noise between prompt and answer.
+          if (['tool_call', 'tool_result', 'reasoning', 'step', 'approval_required', 'incomplete', 'usage'].includes(ev.type)) return;
           homeFeedAppend(agent.name, ev);
           appendEntry(agent, ev);
         },
       });
       // Chained, not fired in parallel: sb_get_messages orders by created_at,
       // so two simultaneous inserts can replay out of order.
-      persistTurn(chatId, fullText, reply, fullText.slice(0, 80));
+      //
+      // An incomplete turn is deliberately NOT persisted. Storing abandoned
+      // chain-of-thought as the assistant's reply meant the next turn replayed
+      // it as history, and the model then reasoned about tool calls it had
+      // only ever *considered* — the source of the "why did you stop and what
+      // did you find" hallucination.
+      if (!turnIncomplete) persistTurn(chatId, fullText, reply, fullText.slice(0, 80));
       const entry = { type: 'assistant', text: reply || '(empty response)' };
+      closeProcessPanel(run.id, agent.id);
       clearStreamingMessage($('#home-feed'), `${run.id}:${agent.id}`);
       homeFeedAppend(agent.name, entry);
       appendEntry(agent, entry);
@@ -923,6 +1457,7 @@ async function sendHomeMessage() {
       emitRunEvent(run.id, 'agent.completed', { agent_id: agent.id });
       return { agent: agent.name, reply };
     } catch (err) {
+      closeProcessPanel(run.id, agent.id, { error: err.name === 'AbortError' ? 'stopped' : err.message });
       clearStreamingMessage($('#home-feed'), `${run.id}:${agent.id}`);
       if (err.name === 'AbortError') {
         setAgentState(agent, 'idle');
@@ -974,6 +1509,143 @@ function openDrawer(capId, cwd) {
   if (capId === 'chats') return renderChatsDrawer();
   if (capId === 'supabase') return renderSupabaseDrawer();
   if (capId === 'ai') return renderAiActionsDrawer();
+  if (capId === 'workdir') return renderWorkingDirDrawer();
+}
+
+// ── working directory: optional, shared by every chat surface ────────────
+// Hotphrases, AI actions, the terminal and the file tools all need to know
+// WHERE they are operating. Projects gets that from its project path; the
+// other surfaces had no way to say, so they silently fell back to the repo
+// root. This is that missing setting.
+function renderWorkingDirDrawer() {
+  drawerTitle.textContent = 'Working directory';
+  drawerBody.replaceChildren();
+
+  const blurb = document.createElement('p');
+  blurb.className = 'panel-copy';
+  blurb.textContent = 'Optional. Hotphrases, AI actions, the terminal and file '
+    + 'tools run here on Home, Code and the Agent hub. Leave it empty to use the '
+    + 'harness repo. Projects ignore this and use their own project path.';
+  drawerBody.append(blurb);
+
+  const current = document.createElement('p');
+  current.className = 'workdir-current';
+  const setCurrent = (dir) => {
+    current.textContent = dir ? `Currently: ${dir}` : 'Currently: not set — using the harness repo.';
+    current.dataset.state = dir ? 'set' : 'unset';
+  };
+  setCurrent(effectiveWorkingDir());
+  drawerBody.append(current);
+
+  const row = document.createElement('div');
+  row.className = 'workdir-row';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'path-input';
+  input.placeholder = '/Users/you/some/project';
+  input.value = effectiveWorkingDir();
+  row.append(input);
+
+  if (isDesktopClient()) {
+    const browse = document.createElement('button');
+    browse.type = 'button'; browse.className = 'mode-button'; browse.textContent = 'Browse…';
+    browse.addEventListener('click', async () => {
+      try {
+        // The bridge resolves with the whole payload ({ok, path}), not a bare
+        // string — assigning it directly produced "[object Object]" as the path.
+        const { path: chosen } = await desktopChooseDirectory();
+        if (chosen) { input.value = chosen; apply(); }
+      } catch (err) {
+        if (err.message === 'cancelled') return;   // closing the picker is not an error
+        status.dataset.state = 'error';
+        status.textContent = err.message;
+      }
+    });
+    row.append(browse);
+  }
+  drawerBody.append(row);
+
+  const status = document.createElement('p');
+  status.className = 'workdir-status';
+  drawerBody.append(status);
+
+  async function apply() {
+    const path = cleanPathInput(input.value);
+    if (!path) return clear();
+    status.textContent = 'Checking…';
+    // Grant FIRST, then validate. The policy layer refuses ungranted paths
+    // before it ever checks whether they exist, so validating first reported
+    // a typo'd path as "permission required" and sent you hunting for a
+    // permissions problem that was really a missing directory.
+    try {
+      await apiFsGrant(path);
+    } catch (err) {
+      // The grant endpoint knows exactly why ("not a directory: …"), which is
+      // far more useful than the generic "permission required" that a later
+      // read would produce. Don't swallow it.
+      status.dataset.state = 'error';
+      status.textContent = `Can't use that directory: ${err.message}`;
+      return;
+    }
+    try {
+      // Accepting a path that does not exist would send every later tool call
+      // somewhere work cannot happen, surfacing much later as a confusing
+      // tool error rather than here, where you can fix it.
+      await apiListDir(path);
+    } catch (err) {
+      status.dataset.state = 'error';
+      status.textContent = `Can't use that directory: ${err.message}`;
+      return;
+    }
+    setDirectory(path);
+    setCurrent(path);
+    status.dataset.state = 'ok';
+    status.textContent = 'Set. Tools on Home, Code and the Agent hub now run here.';
+    renderAllCapabilityBars();
+  }
+
+  function clear() {
+    setDirectory('');
+    input.value = '';
+    setCurrent('');
+    status.dataset.state = 'ok';
+    status.textContent = 'Cleared — falling back to the harness repo.';
+    renderAllCapabilityBars();
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'workdir-actions';
+  const save = document.createElement('button');
+  save.type = 'button'; save.className = 'send-button'; save.textContent = 'Use this directory';
+  save.addEventListener('click', apply);
+  const clearBtn = document.createElement('button');
+  clearBtn.type = 'button'; clearBtn.className = 'mode-button'; clearBtn.textContent = 'Clear';
+  clearBtn.addEventListener('click', clear);
+  actions.append(save, clearBtn);
+  drawerBody.append(actions);
+
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') apply(); });
+
+  // Recently granted roots are the directories you have already approved, so
+  // they are the most likely candidates and save retyping a long path.
+  apiFsGrants().then(({ roots }) => {
+    const recent = (roots || []).filter(r => r !== effectiveWorkingDir()).slice(0, 8);
+    if (!recent.length) return;
+    const head = document.createElement('p');
+    head.className = 'workdir-recent-head';
+    head.textContent = 'Granted directories';
+    const list = document.createElement('div');
+    list.className = 'workdir-recent';
+    for (const root of recent) {
+      const item = document.createElement('button');
+      item.type = 'button'; item.className = 'mode-button';
+      item.textContent = shortenPath(root);
+      item.title = root;
+      item.addEventListener('click', () => { input.value = root; apply(); });
+      list.append(item);
+    }
+    drawerBody.append(head, list);
+  }).catch(() => { /* server down; typing a path still works */ });
 }
 
 // ── AI actions: one-click AI utilities over whatever you're working on ────
@@ -1222,10 +1894,12 @@ async function loadChatIntoHome(chat) {
     empty.textContent = 'This chat has no messages yet.';
     feed.append(empty);
   } else {
+    setHomeChatActive(true);
     for (const m of messages) {
       if (!m.content) continue;
       homeFeedAppend(chat.agent_name || chat.agent_id, { type: m.role === 'user' ? 'user' : 'assistant', text: m.content });
     }
+    feed.scrollTop = feed.scrollHeight;
   }
   closeDrawer();
 }
@@ -1240,6 +1914,8 @@ $('#home-new-chat-btn').addEventListener('click', () => {
   p.className = 'transcript-empty';
   p.textContent = 'Responses from the agent(s) you message will appear here.';
   $('#home-feed').append(p);
+  setHomeChatActive(false);
+  updateJumpButton($('#home-feed'));
 });
 
 function renderSettingsDrawer() {
@@ -1323,7 +1999,7 @@ function renderUploadDrawer() {
 }
 
 function renderTerminalDrawer(cwd) {
-  let liveCwd = cwd || getDirectory() || '.';
+  let liveCwd = cwd || effectiveWorkingDir() || '.';
   drawerTitle.textContent = `Terminal — ${liveCwd}`;
   drawerBody.replaceChildren();
   const copyBtn = document.createElement('button');
@@ -1452,7 +2128,7 @@ async function renderGithubDrawer() {
   } else {
     const p2 = document.createElement('p');
     p2.className = 'panel-copy';
-    p2.innerHTML = 'Paste a <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener">Personal Access Token</a> (repo scope is enough for read + issues). It\'s stored locally on this Mac only (<code>~/.qwen-harness/secrets.json</code>), never in the browser or in this repo.';
+    p2.innerHTML = 'Paste a <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener">Personal Access Token</a>. For project creation and push, use classic <code>repo</code> scope, or a fine-grained token with repository <strong>Contents: Read and write</strong>. It\'s stored locally on this Mac only (<code>~/.qwen-harness/secrets.json</code>), never in the browser or in this repo.';
     const form = document.createElement('form');
     form.className = 'composer';
     form.innerHTML = `<input type="password" placeholder="ghp_…" autocomplete="off" /><button type="submit">Connect</button>`;
@@ -1531,9 +2207,39 @@ async function renderWebsearchDrawer() {
 }
 
 const capBarInstances = [];
-function mountCapabilityBar(container, cwdGetter) {
+/**
+ * @param {HTMLElement} container
+ * @param {() => string} [cwdGetter]
+ * @param {{workingDir?: boolean}} [options]  workingDir: show the optional
+ *   working-directory picker. Off for Projects, which already has a real
+ *   project path — offering a second, competing directory there would just be
+ *   a way to point the tools somewhere the project isn't.
+ */
+function mountCapabilityBar(container, cwdGetter, { workingDir = false } = {}) {
   function render() {
     renderCapabilityBar(container, { onOpen: (capId) => openDrawer(capId, cwdGetter?.()) });
+
+    if (workingDir) {
+      const dir = effectiveWorkingDir();
+      const wd = document.createElement('button');
+      wd.type = 'button';
+      wd.className = 'cap-btn cap-workdir';
+      wd.classList.toggle('is-on', Boolean(dir));
+      // activeProject() reads `projects`, which is declared later in this file.
+      // Calling it while the bar first mounts is a temporal-dead-zone error
+      // that takes the whole capability bar down with it, so guard the read.
+      let fallback = null;
+      try { fallback = activeProject()?.path || null; } catch { /* not ready yet */ }
+      wd.title = dir
+        ? `Working directory: ${dir}\nHotphrases, AI actions, the terminal and file tools run here. Click to change or clear.`
+        : fallback
+          ? `No working directory set — falling back to the active project: ${fallback}. Click to choose one.`
+          : 'No working directory set — file tools and the terminal fall back to the repo. Click to choose one.';
+      wd.innerHTML = `<span class="cap-icon">📂</span><span>${dir ? escapeHtml(shortenPath(dir)) : 'Working dir'}</span>`;
+      wd.addEventListener('click', () => openDrawer('workdir'));
+      container.append(wd);
+    }
+
     const gear = document.createElement('button');
     gear.type = 'button'; gear.className = 'cap-btn'; gear.title = 'Connectors & plugins';
     gear.innerHTML = `<span class="cap-icon">⚙</span><span>Connectors</span>`;
@@ -1543,13 +2249,36 @@ function mountCapabilityBar(container, cwdGetter) {
   capBarInstances.push(render);
   render();
 }
+
+/**
+ * The stored directory, or '' when it carries no information.
+ * The Code file tree persists '.' as it browses, and '.' means "the harness
+ * repo" — which is exactly what "not set" already means. Showing
+ * "Currently: ." as though it were a chosen directory is just confusing.
+ */
+function effectiveWorkingDir() {
+  const dir = (getDirectory() || '').trim();
+  return dir === '.' || dir === './' ? '' : dir;
+}
+
+/** Last two segments, so the button stays short but stays identifiable. */
+function shortenPath(path) {
+  const parts = String(path).replace(/\/+$/, '').split('/').filter(Boolean);
+  return parts.length <= 2 ? `/${parts.join('/')}` : `…/${parts.slice(-2).join('/')}`;
+}
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 function renderAllCapabilityBars() { capBarInstances.forEach(fn => fn()); }
 
-mountCapabilityBar($('#home-capbar'));
-mountCapabilityBar($('#hub-capbar'));
+// Every chat surface gets the optional working-directory picker except
+// Projects, which already has an authoritative project path.
+mountCapabilityBar($('#home-capbar'), () => effectiveWorkingDir() || '.', { workingDir: true });
+mountCapabilityBar($('#hub-capbar'), () => effectiveWorkingDir() || '.', { workingDir: true });
 mountCapabilityBar($('#project-capbar'), () => activeProject()?.path || getDirectory() || currentTreeRoot || '.');
 // Code page's capability bar handles terminal/browser as inline tabs instead of the drawer.
-mountCapabilityBar($('#code-capbar'), () => getDirectory() || currentTreeRoot || '.');
+mountCapabilityBar($('#code-capbar'), () => getDirectory() || currentTreeRoot || '.', { workingDir: true });
 
 // ═══════════════════════════════════════════════════════════════════════
 // CODE — real filesystem browsing, editable files, terminal, browser preview
@@ -1585,7 +2314,7 @@ function basename(path) {
 function currentActionDir() {
   if (selectedNode?.type === 'dir') return selectedNode.path;
   if (selectedNode?.type === 'file') return dirname(selectedNode.path);
-  return currentTreeRoot || getDirectory() || '.';
+  return currentTreeRoot || effectiveWorkingDir() || '.';
 }
 
 function setSelectedNode(node) {
@@ -1854,7 +2583,7 @@ $('#code-composer').addEventListener('submit', async (e) => {
   const text = input.value.trim();
   if (!text) return;
   const project = activeProject();
-  const cwd = currentTreeRoot || project?.path || getDirectory() || '.';
+  const cwd = currentTreeRoot || effectiveWorkingDir() || project?.path || '.';
   const codeAgent = activeAgent();
   const { payload: effortPayload } = effortForPrompt('code', text);
   const { run, controller } = await beginRun({
@@ -1882,6 +2611,7 @@ $('#code-composer').addEventListener('submit', async (e) => {
       onApprovalRequest: handleApprovalRequest,
       onEvent: (ev) => {
         if (ev.type === 'usage') {
+          recordMetricsEvent(ev);
           trackUsageAndMaybeCompact(chatId, modelsConfig.active, ev.totalTokens, (prompt) =>
             runAgentTurn({ modelKey: modelsConfig.active, userText: prompt, systemPrompt: 'You summarize conversations concisely.' })
           );
@@ -2066,9 +2796,10 @@ function renderProjectDetail() {
   $('#project-doc-rename').disabled = !project || !selectedProjectDocName;
   $('#project-doc-delete').disabled = !project || !selectedProjectDocName;
   $('#project-context-query').disabled = !project;
-  for (const btn of document.querySelectorAll('[data-project-git-action], #project-github-create, #project-git-commit, #project-git-checkout, #project-git-merge, #project-worktree-create, #project-worktree-remove, #project-pr-create, #project-issue-create, #project-workflows')) {
+  for (const btn of document.querySelectorAll('[data-project-git-action], #project-git-commit, #project-git-checkout, #project-git-merge, #project-worktree-create, #project-worktree-remove, #project-pr-create, #project-issue-create, #project-workflows')) {
     btn.disabled = !project;
   }
+  $('#project-github-create').disabled = !project || Boolean(project.repo?.remote);
   if (!project) {
     $('#project-detail-title').textContent = 'Select a project';
     $('#project-detail-path').textContent = '—';
@@ -2094,7 +2825,7 @@ function renderProjectDetail() {
   $('#project-workspace-toggle').textContent = projectWorkspaceOpen ? 'Workspace -' : 'Workspace +';
   $('#project-workspace-toggle').setAttribute('aria-expanded', String(projectWorkspaceOpen));
   $('#project-github-status').textContent = project.repo?.github?.html_url
-    ? `Published: ${project.repo.github.html_url}`
+    ? (project.repo.github.push_pending ? `Remote created; initial push pending: ${project.repo.github.html_url}` : `Published: ${project.repo.github.html_url}`)
     : 'Local Git repo ready. Publish is optional.';
   $('#project-github-form').hidden = !projectRepoFormOpen;
   $('#project-repo-name').value = $('#project-repo-name').value || (project.slug || project.name);
@@ -2221,6 +2952,7 @@ function renderProjectComposer(project) {
 function renderProjectMainFeed(project) {
   const feed = $('#project-main-feed');
   const rows = projectMainFeed[project.id] || [];
+  const pinned = isPinnedToBottom(feed);
   feed.replaceChildren();
   if (!rows.length) {
     const empty = document.createElement('p');
@@ -2233,7 +2965,8 @@ function renderProjectMainFeed(project) {
     const agent = agents.find(a => a.name === row.agent || a.id === row.agent);
     feed.append(renderChatEntry(agent, row.entry, row.agent || 'project', 'project'));
   }
-  feed.scrollTop = feed.scrollHeight;
+  if (pinned) feed.scrollTop = feed.scrollHeight;
+  updateJumpButton(feed);
 }
 
 function appendProjectMainFeed(project, agentName, entry) {
@@ -2281,8 +3014,10 @@ function setGitOutput(label, payload) {
   const git = payload?.git || payload;
   const text = [
     `${label}`,
+    payload?.error || '',
     git?.stdout || '',
     git?.stderr || '',
+    payload?.recovery || '',
     payload?.github?.html_url ? `GitHub: ${payload.github.html_url}` : '',
     payload?.github?.workflows ? payload.github.workflows.map(item => `${item.id}  ${item.state}  ${item.name} (${item.path})`).join('\n') : '',
   ].filter(Boolean).join('\n');
@@ -2525,10 +3260,14 @@ async function sendProjectMessage() {
     model_key: modelKey, agent_ids: targets.map(agent => agent.id), ...effortPayload, ...consumeRunLineage(),
   });
   markSurfaceRun('project', run);
+  // One row in the shared feed, however many agents receive it.
+  lastPromptFor.set('project', text);
+  appendProjectMainFeed(project, targets.length === 1 ? targets[0].name : 'you', {
+    type: 'user', text, recipients: targets.map(displayName),
+  });
   for (const agent of targets) {
-    const entry = { type: 'user', text };
-    appendProjectMainFeed(project, agent.name, entry);
-    appendEntry(agent, entry);
+    appendEntry(agent, stampEntry({ type: 'user', text }));
+    openProcessPanel($('#project-main-feed'), run.id, agent, 'Working', modelKey);
     setAgentState(agent, 'listening');
   }
   await sleep(200);
@@ -2550,6 +3289,9 @@ async function sendProjectMessage() {
         onApprovalRequest: handleApprovalRequest,
       onEvent: (ev) => {
           if (ev.type === 'usage') {
+            // Metrics first: this branch returns early, and returning before
+            // recordProcessEvent meant the panel never saw a single token.
+            recordMetricsEvent(ev);
             trackUsageAndMaybeCompact(chatId, modelKey, ev.totalTokens, (prompt) =>
               runAgentTurn({ modelKey, userText: prompt, systemPrompt: 'You summarize conversations concisely.' })
             );
@@ -2562,6 +3304,8 @@ async function sendProjectMessage() {
             else if (ev.name === 'read_file' && ev.args?.path) logWorkDone(agent.id, 'read', ev.args.path, chatId, `project: ${project.name}`);
           }
           if (ev.type === 'tool_result') emitRunEvent(run.id, 'agent.tool.completed', { agent_id: agent.id });
+          recordProcessEvent(run.id, agent.id, ev);
+          if (['tool_call', 'tool_result', 'reasoning', 'step', 'approval_required', 'incomplete', 'usage'].includes(ev.type)) return;
           appendProjectMainFeed(project, agent.name, ev);
           appendEntry(agent, ev);
         },
@@ -2576,6 +3320,7 @@ async function sendProjectMessage() {
       return { agent: agent.name, reply };
     } catch (err) {
       clearStreamingMessage($('#project-main-feed'), `${run.id}:${agent.id}`);
+      closeProcessPanel(run.id, agent.id, { error: err.name === 'AbortError' ? 'stopped' : err.message });
       if (err.name === 'AbortError') return { agent: agent.name, cancelled: true };
       const entry = { type: 'system', text: err.message };
       appendProjectMainFeed(project, agent.name, entry);
@@ -2701,6 +3446,10 @@ async function submitProjectRepoForm({ initialPush = false } = {}) {
     return;
   }
   const actionLabel = initialPush ? 'create the repo and push an initial commit' : 'create the repo';
+  if (project.repo?.remote) {
+    setProjectStatus('A GitHub remote already exists. Use Git Actions → Push to send the initial commit.', true);
+    return;
+  }
   const approved = confirm(`Create ${privateRepo ? 'private' : 'public'} GitHub repo "${repoName}" for "${project.name}" and ${actionLabel}?`);
   if (!approved) return;
   projectRepoFormOpen = false;
@@ -2723,7 +3472,12 @@ async function submitProjectRepoForm({ initialPush = false } = {}) {
       setGitOutput('Create + initial push', result);
       setProjectStatus(`Published: ${result.github.html_url}`);
     } catch (err) {
-      setGitOutput('Create + initial push', err.message);
+      if (err.project) {
+        projects = projects.map(p => p.id === err.project.id ? err.project : p);
+        activeProjectId = err.project.id;
+        renderProjects();
+      }
+      setGitOutput('Create + initial push', err);
       setProjectStatus(err.message, true);
     }
     return;
@@ -3124,7 +3878,7 @@ $('#composer').addEventListener('submit', async (e) => {
   input.value = '';
   const agent = agents.find(a => a.id === activeAgentId);
   if (hubMode === 'live') {
-    const cwd = getDirectory() || '.';
+    const cwd = effectiveWorkingDir() || '.';
     const { payload: effortPayload } = effortForPrompt('hub', text);
     const { run, controller } = await beginRun({
       surface: 'hub', instruction: text, cwd, model_key: agent.modelKey, agent_ids: [agent.id], ...effortPayload, ...consumeRunLineage(),
@@ -3147,6 +3901,8 @@ $('#composer').addEventListener('submit', async (e) => {
             emitRunEvent(run.id, 'agent.tool.started', { agent_id: agent.id, tool: ev.name, args: ev.args });
           }
           if (ev.type === 'tool_result') emitRunEvent(run.id, 'agent.tool.completed', { agent_id: agent.id });
+          recordProcessEvent(run.id, agent.id, ev);
+          if (['tool_call', 'tool_result', 'reasoning', 'step', 'approval_required', 'incomplete', 'usage'].includes(ev.type)) return;
           appendEntry(agent, ev);
         },
       });
@@ -3210,7 +3966,7 @@ const savedTheme = localStorage.getItem(THEME_KEY) || (matchMedia('(prefers-colo
 applyTheme(savedTheme);
 $('#theme-toggle').addEventListener('click', () => applyTheme(document.documentElement.classList.contains('dark') ? 'light' : 'dark'));
 
-const ROUTE_TITLES = { home: 'Home', code: 'Code', projects: 'Projects', hub: 'Agent hub', skills: 'Skills & Tools' };
+const ROUTE_TITLES = { home: 'Home', code: 'Code', projects: 'Projects', hub: 'Agent hub', skills: 'Skills & Tools', profile: 'Profile' };
 let catalogLoaded = false;
 function catalogRow(title, detail, meta = '') {
   const row = document.createElement('article'); row.className = 'catalog-row';
@@ -3295,6 +4051,58 @@ $('#add-skill-form').addEventListener('submit', async (event) => {
     catalogLoaded = false; invalidateSkillDefs(); await renderSkillsAndTools(); setCatalogTab('skills');
   } catch (error) { status.textContent = error.message; }
 });
+// ── user profile ───────────────────────────────────────────────────────
+// Fields are rendered from the server's list rather than duplicated here, so
+// adding a field to tools/profile.py is all it takes.
+let profileFields = [];
+async function renderProfile() {
+  const form = $('#profile-form');
+  if (!form) return;
+  let data;
+  try {
+    data = await apiProfileGet();
+  } catch (err) {
+    $('#profile-status').textContent = `Couldn't load: ${err.message}`;
+    return;
+  }
+  profileFields = data.fields || [];
+  form.replaceChildren();
+  for (const field of profileFields) {
+    const label = document.createElement('label');
+    label.className = 'field profile-field';
+    const name = document.createElement('span');
+    name.textContent = field.label;
+    const input = field.key === 'notes' || field.key === 'avoid' || field.key === 'goals'
+      ? document.createElement('textarea')
+      : document.createElement('input');
+    if (input.tagName === 'TEXTAREA') input.rows = 3;
+    input.id = `profile-${field.key}`;
+    input.value = data.profile?.[field.key] || '';
+    // Hint as placeholder only — rendering it again underneath doubled every
+    // field's text for no extra information.
+    input.placeholder = field.hint;
+    label.append(name, input);
+    form.append(label);
+  }
+  $('#profile-tripwire').hidden = !data.has_name;
+  $('#profile-preview').textContent = data.prompt_block || 'Nothing yet — fill in a field and save.';
+  $('#profile-status').textContent = `${data.filled} of ${data.total} fields filled.`;
+}
+
+$('#profile-save')?.addEventListener('click', async () => {
+  const payload = {};
+  for (const field of profileFields) payload[field.key] = $(`#profile-${field.key}`)?.value || '';
+  const status = $('#profile-status');
+  try {
+    await apiProfileSave(payload);
+    window.dispatchEvent(new CustomEvent('qh-profile-saved'));
+    await renderProfile();
+    status.textContent = 'Saved — models will use this from the next message.';
+  } catch (err) {
+    status.textContent = `Save failed: ${err.message}`;
+  }
+});
+
 function switchRoute(route) {
   document.querySelectorAll('.rail-link').forEach(link => link.classList.toggle('is-active', link.dataset.route === route));
   $('#view-home').hidden = route !== 'home';
@@ -3302,11 +4110,13 @@ function switchRoute(route) {
   $('#view-projects').hidden = route !== 'projects';
   $('#view-hub').hidden = route !== 'hub';
   $('#view-skills').hidden = route !== 'skills';
+  $('#view-profile').hidden = route !== 'profile';
   $('#route-title').textContent = ROUTE_TITLES[route];
   localStorage.setItem(ROUTE_KEY, route);
   if (route === 'projects') refreshProjects();
   if (route === 'hub') renderHub();
   if (route === 'skills') renderSkillsAndTools();
+  if (route === 'profile') renderProfile();
 }
 document.querySelectorAll('.rail-link').forEach(link => link.addEventListener('click', () => switchRoute(link.dataset.route)));
 
@@ -3478,6 +4288,13 @@ async function pollResourceMonitor() {
 }
 
 // ── boot ──────────────────────────────────────────────────────────────────
+// Before anything renders agents, reconcile with the shared roster — otherwise
+// the first paint shows this browser's stale avatars and only corrects later.
+await syncAgentRoster();
+window.addEventListener('qh-agents-synced', () => {
+  populateHomeSelectors(); renderHomeGreetingAvatars(); renderHubFocusSelect();
+  if (!$('#view-hub').hidden) renderHub();
+});
 renderTOD();
 populateHomeSelectors();
 renderHomeGreetingAvatars();

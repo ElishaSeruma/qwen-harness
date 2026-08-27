@@ -110,6 +110,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         appMenu.addItem(withTitle: "Quit Qwen Harness", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
+        // An Edit menu is not decoration on macOS: ⌘A/⌘C/⌘V/⌘X are delivered
+        // to the first responder through this menu's key equivalents. Without
+        // it those shortcuts are simply dead in the WKWebView — no copy, no
+        // paste, no select-all anywhere in the app. The standard selectors are
+        // nil-targeted so AppKit routes them to whatever has focus.
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        let pasteMatch = editMenu.addItem(
+            withTitle: "Paste and Match Style",
+            action: Selector(("pasteAsPlainText:")),
+            keyEquivalent: "v")
+        pasteMatch.keyEquivalentModifierMask = [.command, .option, .shift]
+        editMenu.addItem(withTitle: "Delete", action: #selector(NSText.delete(_:)), keyEquivalent: "")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        // Deliberately no Find item: performTextFinderAction: needs a tag and
+        // WKWebView does not honour it, so the menu entry would look functional
+        // and do nothing.
+        editItem.submenu = editMenu
+
         let viewItem = NSMenuItem()
         main.addItem(viewItem)
         let viewMenu = NSMenu(title: "View")

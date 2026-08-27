@@ -59,6 +59,12 @@ This is a single-user local service bound to 127.0.0.1. Filesystem access is
 limited to persisted user grants, secrets are blocked from agent tools, and
 state-changing tool calls require an explicit approval context.
 """
+
+# server.py is launched by whatever `python3` resolves to. A Finder-launched
+# app hands us a bare PATH, where that is /usr/bin/python3 — Python 3.9 — so
+# PEP 604 annotations (str | None) must be deferred, as in every other module
+# here. Without this the server fails to start at all in the app.
+from __future__ import annotations
 import json
 import os
 import re
@@ -66,6 +72,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from email.utils import formatdate
 import time
 import uuid
 import base64
@@ -130,11 +137,14 @@ TOOL_APPROVAL_SCOPES = {
     'memory_write': 'write persistent memory',
     'memory_forget': 'delete persistent memory',
     'create_display': 'open a generated display',
+    'sandbox_promote': 'apply verified changes to your real files',
 }
 TOOL_CWD_NAMES = {
     'read_file', 'write_file', 'append_file', 'list_dir', 'run_shell',
     'edit_file', 'search_files', 'find_files',
+    'sandbox_status', 'sandbox_verify', 'sandbox_promote', 'sandbox_discard',
 }
+SANDBOX_TOOLS = {'sandbox_status', 'sandbox_verify', 'sandbox_promote', 'sandbox_discard'}
 
 CONTENT_TYPES = {
     '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -211,20 +221,74 @@ def _ollama_tags():
         return None
 
 
+# A GUI app launched from Finder or the Dock inherits a bare PATH —
+# /usr/bin:/bin:/usr/sbin:/sbin — not your shell's. Homebrew lives in
+# /opt/homebrew/bin, so `shutil.which('ollama')` fails even with ollama
+# installed, and "Start services" reports it as missing. The same blindness
+# hits git, npm, node and every test command the sandbox runs, so this is
+# repaired once, globally, at startup.
+EXTRA_PATH_DIRS = (
+    '/opt/homebrew/bin', '/opt/homebrew/sbin',      # Apple Silicon Homebrew
+    '/usr/local/bin', '/usr/local/sbin',            # Intel Homebrew, manual installs
+    str(Path.home() / '.local' / 'bin'),
+    str(Path.home() / '.ollama' / 'bin'),
+    '/Applications/Ollama.app/Contents/Resources',  # the Ollama.app bundle
+)
+
+
+def repair_path() -> str:
+    """Put the usual binary locations back on PATH. Returns the new PATH."""
+    current = os.environ.get('PATH', '')
+    parts = [p for p in current.split(os.pathsep) if p]
+    for extra in EXTRA_PATH_DIRS:
+        if extra not in parts and os.path.isdir(extra):
+            parts.append(extra)
+    os.environ['PATH'] = os.pathsep.join(parts)
+    return os.environ['PATH']
+
+
+def find_ollama() -> str | None:
+    """Absolute path to the ollama binary, PATH or not."""
+    found = shutil.which('ollama')
+    if found:
+        return found
+    for directory in EXTRA_PATH_DIRS:
+        candidate = os.path.join(directory, 'ollama')
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _services_start_ollama():
     """Ensure ollama is listening. Returns 'running' | 'started' | 'unavailable'."""
     if _ollama_tags() is not None:
         _services_log(f'Ollama already listening on {OLLAMA_HOST}')
         return 'running'
-    if not shutil.which('ollama'):
-        _services_log('! ollama binary not found on PATH — install it first (brew install ollama)')
+    binary = find_ollama()
+    if not binary:
+        _services_log('! ollama binary not found — install it first (brew install ollama)')
+        _services_log(f'  searched PATH ({os.environ.get("PATH", "")}) and the usual install locations')
         return 'unavailable'
-    _services_log('Ollama not responding — starting `ollama serve`…')
+    _services_log(f'Ollama not responding — starting `{binary} serve`…')
+    # Ollama defaults to a 4k context under 24 GiB of VRAM. The agent loop sets
+    # num_ctx per request via the native API, but anything that does not (a
+    # direct /v1 call, another client) would still get 4k. Raise the
+    # server-wide default so nothing silently runs starved.
+    serve_env = dict(os.environ)
+    try:
+        from tools.context_budget import recommend_context, total_ram_gb
+        default_ctx = recommend_context(4.0, None, total_ram_gb())['context']
+        serve_env.setdefault('OLLAMA_CONTEXT_LENGTH', str(default_ctx))
+        _services_log(f"  default context: {default_ctx} tokens (Ollama's own default is 4096)")
+    except Exception as exc:
+        sys.stderr.write(f'[gui-server] context sizing skipped: {exc}\n')
     try:
         # Detached and fully redirected: this outlives the request, and must not
         # inherit our pipes or it would block once nobody drains them.
         subprocess.Popen(
-            ['ollama', 'serve'],
+            # Absolute path, not a bare name: PATH is repaired at startup, but
+            # resolving it here means this works even if that ever regresses.
+            [binary, 'serve'], env=serve_env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL, start_new_session=True,
         )
@@ -554,6 +618,20 @@ class Handler(BaseHTTPRequestHandler):
         if not (email.get('stdout') or '').strip():
             self._run_git(['config', 'user.email', 'qwen-harness@local'], project_dir)
 
+    def _sync_project_remote(self, project):
+        """Reconcile a configured origin after an interrupted create-and-push."""
+        project_dir = Path(project.get('path', ''))
+        if not (project_dir / '.git').exists():
+            return False
+        remote = self._run_git(['remote', 'get-url', 'origin'], project_dir).get('stdout', '').strip()
+        if not remote or project.get('repo', {}).get('remote') == remote:
+            return False
+        repo = project.setdefault('repo', {'type': 'git', 'initialized': True})
+        repo['remote'] = remote
+        if not repo.get('github') and remote.startswith('https://github.com/'):
+            repo['github'] = {'html_url': remote[:-4] if remote.endswith('.git') else remote, 'push_pending': True}
+        return True
+
     # ── routing ──────────────────────────────────────────────────────────
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -581,6 +659,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_project_context(parse_qs(parsed.query))
         if parsed.path == '/api/projects/search':
             return self._handle_project_search(parse_qs(parsed.query))
+        if parsed.path == '/api/context/plan':
+            return self._handle_context_plan()
+        if parsed.path == '/api/agents':
+            return self._handle_agents_get()
+        if parsed.path == '/api/profile':
+            return self._handle_profile_get()
+        if parsed.path == '/api/feedback/summary':
+            return self._handle_feedback_summary()
         if parsed.path == '/api/tools/list':
             return self._handle_tools_list()
         if parsed.path == '/api/skills/list':
@@ -661,6 +747,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_run_update()
         if parsed.path == '/api/runs/cancel':
             return self._handle_run_cancel()
+        if parsed.path == '/api/agents/save':
+            return self._handle_agents_save()
+        if parsed.path == '/api/profile/save':
+            return self._handle_profile_save()
+        if parsed.path == '/api/feedback/rate':
+            return self._handle_feedback_rate()
+        if parsed.path == '/api/feedback/export':
+            return self._handle_feedback_export()
+        if parsed.path == '/api/runs/clear':
+            return self._handle_runs_clear()
         if parsed.path == '/api/runs/retry':
             return self._handle_run_retry()
         if parsed.path == '/api/supabase/connect':
@@ -701,11 +797,33 @@ class Handler(BaseHTTPRequestHandler):
         content_type = CONTENT_TYPES.get(target.suffix, 'application/octet-stream')
         try:
             data = target.read_bytes()
+            stat = target.stat()
         except OSError as exc:
             return self._send_json({'error': str(exc)}, 500)
+
+        # Without cache headers a browser applies HEURISTIC caching: it may
+        # serve app.js from cache for hours without ever asking us. That is how
+        # a browser ends up running last week's JS — old agent avatars, a blank
+        # Profile page, tools the model cannot see — while a freshly launched
+        # WKWebView loads the current files and behaves completely differently.
+        #
+        # 'no-cache' does not mean "do not store"; it means "revalidate every
+        # time". Combined with the ETag below, an unchanged file still costs
+        # only a 304, so this is correctness with no real bandwidth penalty.
+        etag = '"%x-%x"' % (int(stat.st_mtime), stat.st_size)
+        if self.headers.get('If-None-Match') == etag:
+            self.send_response(304)
+            self.send_header('ETag', etag)
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            return
+
         self.send_response(200)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(data)))
+        self.send_header('ETag', etag)
+        self.send_header('Last-Modified', formatdate(stat.st_mtime, usegmt=True))
+        self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         self.wfile.write(data)
 
@@ -1013,6 +1131,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             args['cwd'] = str(cwd)
 
+        if name in SANDBOX_TOOLS:
+            args['run_id'] = context.get('run_id') or ''
+
         if name in {'read_file', 'write_file', 'append_file', 'edit_file'} and args.get('path'):
             raw = Path(str(args['path'])).expanduser()
             target = (Path(args.get('cwd') or REPO_ROOT) / raw).resolve() if not raw.is_absolute() else raw.resolve()
@@ -1024,9 +1145,72 @@ class Handler(BaseHTTPRequestHandler):
                     'path': str(target),
                 }, 403)
 
+        # Every mutating tool call inside a run is staged in that run's sandbox
+        # rather than applied to the real tree. Enforced here, at the single
+        # chokepoint every agent's tool call passes through, so an agent cannot
+        # opt out by phrasing the call differently.
+        redirected = self._apply_sandbox(name, args, context)
+        if redirected is not None:
+            return self._send_json({'result': redirected},
+                                   403 if redirected.get('permission_required') else 200)
+
         result = execute_tool(name, args)
         status = 403 if isinstance(result, dict) and result.get('permission_required') else 200
         self._send_json({'result': result}, status)
+
+    # ── sandbox ──────────────────────────────────────────────────────────
+    # Writes go to a per-run staging copy; shell commands run confined. The
+    # real tree is only touched by sandbox_promote, and only after tests pass.
+    SANDBOX_WRITE_TOOLS = {'write_file', 'edit_file', 'append_file'}
+
+    def _apply_sandbox(self, name, args, context):
+        """Returns a result dict when the call was handled by the sandbox, else None."""
+        from tools import execute_tool
+        from tools.sandbox import SandboxError, get_sandbox
+
+        run_id = context.get('run_id')
+        # No run means an interactive one-off (the Web search button, a manual
+        # tool call) — those are the user's own actions, not autonomous ones.
+        if not run_id or context.get('sandbox') is False:
+            return None
+        if name not in self.SANDBOX_WRITE_TOOLS and name not in {'run_shell', 'read_file'}:
+            return None
+
+        project_root = Path(args.get('cwd') or REPO_ROOT)
+        try:
+            sandbox = get_sandbox(run_id, project_root)
+            if name == 'run_shell':
+                out = sandbox.run(args.get('command', ''), timeout=int(args.get('timeout') or 120))
+                return {**out, 'sandboxed': True}
+
+            target = Path(str(args.get('path', ''))).expanduser()
+            target = target if target.is_absolute() else (project_root / target).resolve()
+
+            if name == 'read_file':
+                staged = sandbox.staged_path(target)
+                # Read back the agent's own staged edit, not the stale original.
+                if not staged.exists():
+                    return None
+                args = {**args, 'path': str(staged), 'cwd': str(sandbox.work)}
+                return {**execute_tool('read_file', args), 'sandboxed': True, 'staged': True}
+
+            staged = sandbox.materialize(target)
+            result = execute_tool(name, {**args, 'path': str(staged), 'cwd': str(sandbox.work)})
+            # Only record a change the write actually made. Recording first hid
+            # a failed staged write behind a reassuring "staged" note, and the
+            # tests then ran against unmodified code and passed.
+            if isinstance(result, dict) and result.get('error'):
+                return {**result, 'sandboxed': True, 'staged_path': str(staged)}
+            sandbox.record(target)
+            return {
+                **result,
+                'sandboxed': True,
+                'staged_path': str(staged),
+                'real_path': str(target),
+                'note': 'Staged only. Run sandbox_verify, then sandbox_promote to apply.',
+            }
+        except SandboxError as exc:
+            return {'error': str(exc), 'sandboxed': True}
 
     # ── Durable runs and live events ────────────────────────────────────
     def _handle_runs_list(self, parsed):
@@ -1091,6 +1275,84 @@ class Handler(BaseHTTPRequestHandler):
         run = RUN_STORE.cancel(body.get('run_id'))
         self._sync_run_background(run)
         self._send_json({'run': run} if run else {'error': 'run not found'}, 200 if run else 404)
+
+    # ── context budget ───────────────────────────────────────────────────
+    def _handle_context_plan(self):
+        """Per-model num_ctx, sized from this machine's actual RAM."""
+        from tools.context_budget import plan_for_models
+        models = []
+        try:
+            with urllib.request.urlopen(f'{OLLAMA_HOST}/api/tags', timeout=3) as res:
+                models = json.load(res).get('models', [])
+        except Exception:
+            pass
+        self._send_json(plan_for_models(models))
+
+    # ── shared agent roster ──────────────────────────────────────────────
+    def _handle_agents_get(self):
+        from tools.agents_store import get
+        self._send_json(get())
+
+    def _handle_agents_save(self):
+        from tools.agents_store import save
+        result = save(self._read_json_body() or {})
+        self._send_json(result, 400 if 'error' in result else 200)
+
+    # ── user profile ─────────────────────────────────────────────────────
+    def _handle_profile_get(self):
+        from tools.profile import status
+        self._send_json(status())
+
+    def _handle_profile_save(self):
+        from tools.profile import save
+        self._send_json(save(self._read_json_body() or {}))
+
+    # ── output ratings ───────────────────────────────────────────────────
+    def _handle_feedback_rate(self):
+        from tools.feedback import rate, unrate
+        body = self._read_json_body()
+        # An explicit null rating means "clear this rating" — treat it as an
+        # un-rate whether or not a message_id came with it. Previously a null
+        # rating without an id fell through to int(None) and 400'd, which is
+        # what a mis-click on an unrated message produced.
+        if 'rating' in body and body.get('rating') is None:
+            message_id = body.get('message_id')
+            return self._send_json(unrate(str(message_id)) if message_id
+                                   else {'status': 'ok', 'removed': 0})
+        try:
+            rating = int(body.get('rating'))
+        except (TypeError, ValueError):
+            return self._send_json({'error': 'rating must be -1 (dislike), 1 (like) or 2 (love)'}, 400)
+        result = rate(
+            rating=rating,
+            response=str(body.get('response') or ''),
+            prompt=str(body.get('prompt') or ''),
+            model=str(body.get('model') or ''),
+            surface=str(body.get('surface') or ''),
+            effort=body.get('effort'),
+            tools_used=body.get('tools_used') or [],
+            message_id=body.get('message_id'),
+        )
+        self._send_json(result, 400 if 'error' in result else 200)
+
+    def _handle_feedback_summary(self):
+        from tools.feedback import summary
+        from tools.profile import describe
+        # The agent loop fetches this every turn anyway; carrying the profile
+        # block here keeps prompt assembly to a single round-trip.
+        self._send_json({**summary(), 'profile_block': describe()})
+
+    def _handle_feedback_export(self):
+        from tools.feedback import export_preference_pairs, export_sft
+        body = self._read_json_body()
+        kind = str(body.get('kind') or 'pairs')
+        self._send_json(export_sft() if kind == 'sft' else export_preference_pairs())
+
+    def _handle_runs_clear(self):
+        from gui.run_store import RUN_STORE
+        # Deliberately keeps in-flight runs: the button clears history, it is
+        # not a way to abandon work that is still going.
+        self._send_json(RUN_STORE.clear_finished())
 
     def _handle_run_retry(self):
         from gui.run_store import RUN_STORE
@@ -1419,9 +1681,13 @@ class Handler(BaseHTTPRequestHandler):
     # ── Projects ────────────────────────────────────────────────────────
     def _handle_projects(self):
         projects = self._load_projects()
+        changed = False
         for project in projects:
             project['exists'] = Path(project.get('path', '')).exists()
             project['git_exists'] = (Path(project.get('path', '')) / '.git').exists()
+            changed = self._sync_project_remote(project) or changed
+        if changed:
+            self._save_projects(projects)
         self._send_json({'projects': projects})
 
     def _handle_project_create(self):
@@ -1681,6 +1947,14 @@ class Handler(BaseHTTPRequestHandler):
         if denied:
             return denied
 
+        existing_remote = self._run_git(['remote', 'get-url', 'origin'], project_dir).get('stdout', '').strip()
+        if existing_remote:
+            return self._send_json({
+                'error': 'This project already has a GitHub remote. Use Git Actions → Push to send the initial commit instead of creating the repository again.',
+                'project': project,
+                'remote': existing_remote,
+            }, 409)
+
         repo_name = self._slugify(body.get('repo_name') or project.get('slug') or project.get('name'))
         created = gh_create_repo(
             repo_name,
@@ -1715,11 +1989,23 @@ class Handler(BaseHTTPRequestHandler):
         if not remote_result['ok']:
             return self._send_json({'error': 'setting git remote failed', 'git': remote_result, 'github': created}, 500)
 
+        # Persist the remote before pushing. A token can create a repository
+        # but still lack Contents: write; retaining this state avoids creating
+        # a duplicate repository after the user reconnects and retries Push.
+        created['push_pending'] = True
+        project['repo']['remote'] = remote
+        project['repo']['github'] = created
+        self._upsert_project(project)
+
         push = self._push_with_token(project_dir, remote, branch)
         if not push['ok']:
-            return self._send_json({'error': 'git push failed', 'git': push, 'github': created}, 500)
+            denied_write = 'Write access to repository not granted' in (push.get('stderr') or '')
+            message = ('GitHub created the repository, but this token cannot push to it (403). '
+                       'Reconnect GitHub with a classic PAT that has repo scope, or a fine-grained PAT with '
+                       'Contents: Read and write for this repository, then use Git Actions → Push.') if denied_write else 'git push failed'
+            return self._send_json({'error': message, 'git': push, 'github': created, 'project': project}, 403 if denied_write else 500)
 
-        project['repo']['remote'] = remote
+        created['push_pending'] = False
         project['repo']['github'] = created
         self._upsert_project(project)
         self._send_json({'ok': True, 'project': project, 'github': created, 'git': push})
@@ -1905,6 +2191,13 @@ class Handler(BaseHTTPRequestHandler):
         elif action == 'create_remote':
             if not require_approval('GitHub repo creation'):
                 return
+            existing_remote = self._run_git(['remote', 'get-url', 'origin'], project_dir).get('stdout', '').strip()
+            if existing_remote:
+                return self._send_json({
+                    'error': 'This project already has a GitHub remote. Use Git Actions → Push to send the initial commit instead of creating the repository again.',
+                    'project': updated_project,
+                    'remote': existing_remote,
+                }, 409)
             repo_name = self._slugify(body.get('repo_name') or project.get('slug') or project.get('name'))
             created = gh_create_repo(
                 repo_name,
@@ -1924,6 +2217,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = self._run_git(['remote', 'add', 'origin', remote], project_dir)
             if not result['ok']:
                 return self._send_json({'error': 'setting git remote failed', 'git': result, 'github': created}, 500)
+            created['push_pending'] = True
             updated_project['repo']['remote'] = remote
             updated_project['repo']['github'] = created
             self._upsert_project(updated_project)
@@ -1933,6 +2227,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             remote = remote or self._run_git(['remote', 'get-url', 'origin'], project_dir).get('stdout', '').strip()
             result = self._push_with_token(project_dir, remote, branch)
+            if result['ok'] and updated_project.get('repo', {}).get('github'):
+                updated_project['repo']['github']['push_pending'] = False
+                self._upsert_project(updated_project)
+            elif not result['ok'] and 'Write access to repository not granted' in (result.get('stderr') or ''):
+                result['recovery'] = ('Reconnect GitHub with a PAT that has Contents: Read and write for this repository, '
+                                      'then retry Push. The remote and initial commit were kept intact.')
         elif action == 'pull':
             if not require_approval('pull'):
                 return
@@ -2037,10 +2337,27 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8420
+    # Before anything else: a Finder-launched app hands us a bare PATH, which
+    # makes ollama, git, npm and every sandbox test command invisible. Repair
+    # it once here so every subprocess this server spawns inherits the fix.
+    repaired = repair_path()
     server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     print(f"qwen-harness GUI server → http://127.0.0.1:{port}/gui/")
     print(f"(bound to localhost only; serving static files from {REPO_ROOT})")
+    ollama_binary = find_ollama()
+    print(f"(ollama: {ollama_binary or 'NOT FOUND'})")
+    if not ollama_binary:
+        sys.stderr.write(f"[gui-server] ollama not found on PATH={repaired}\n")
     try:
+        # Sandboxes from runs that never finished would otherwise accumulate
+        # under ~/.qwen-harness/sandboxes forever.
+        try:
+            from tools.sandbox import cleanup_stale
+            stale = cleanup_stale()
+            if stale:
+                print(f"(cleared {stale} stale sandbox director{'y' if stale == 1 else 'ies'})")
+        except Exception as exc:
+            sys.stderr.write(f"[gui-server] sandbox cleanup skipped: {exc}\n")
         server.serve_forever()
     except KeyboardInterrupt:
         server.shutdown()
