@@ -15,6 +15,31 @@ from tools.policy import STATE_DIR, atomic_write_json
 RUNS_PATH = STATE_DIR / "runs.json"
 ACTIVE_STATES = {"queued", "planning", "running", "thinking", "working", "verifying", "waiting_permission"}
 TERMINAL_STATES = {"completed", "failed", "cancelled", "interrupted"}
+TERMINAL_TASK_STATES = {"completed", "failed", "cancelled", "skipped"}
+
+
+def _settle_tasks(tasks: Any, status: str) -> list[dict[str, Any]]:
+    """Mark every still-unfinished task with `status`, leaving finished ones alone."""
+    if not isinstance(tasks, list):
+        return tasks if tasks is not None else []
+    settled = []
+    for task in tasks:
+        if isinstance(task, dict) and task.get("status") not in TERMINAL_TASK_STATES:
+            task = {**task, "status": status}
+        settled.append(task)
+    return settled
+
+
+# run.running / run.updated are bookkeeping; they say nothing about what the
+# model is actually doing, so the live line skips past them.
+_BOOKKEEPING_EVENTS = {"run.running", "run.updated", "run.created"}
+
+
+def _last_activity_event(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for event in reversed(events or []):
+        if event.get("type") not in _BOOKKEEPING_EVENTS:
+            return copy.deepcopy(event)
+    return None
 
 
 def utc_now() -> str:
@@ -50,6 +75,14 @@ class RunStore:
                 run["updated_at"] = utc_now()
                 self._append_event_unlocked(run, "run.interrupted", {"reason": "backend restarted"})
                 changed = True
+            # Repair records written before cancel() settled its subtasks: a
+            # finished run whose tasks still say "running" reads as though work
+            # is ongoing forever.
+            if run.get("status") in TERMINAL_STATES and run.get("tasks"):
+                settled = _settle_tasks(run["tasks"], run["status"])
+                if settled != run["tasks"]:
+                    run["tasks"] = settled
+                    changed = True
         if changed:
             self._save()
 
@@ -86,6 +119,10 @@ class RunStore:
                 summary = copy.deepcopy(summary)
                 summary["last_event_type"] = last.get("type") if last else None
                 summary["event_count"] = len(events)
+                # The most recent *meaningful* event, so the drawer can say
+                # "Nova → read_file (config.py)" instead of just "Working…".
+                # One event, not the whole log — the payload stays small.
+                summary["last_activity"] = _last_activity_event(events)
                 summaries.append(summary)
             return summaries
 
@@ -159,7 +196,13 @@ class RunStore:
             if not run:
                 return None
             status = payload.get("status")
-            if status:
+            # A terminal run stays terminal. The browser keeps unwinding an
+            # aborted turn for a moment after the user hits Stop, and those
+            # in-flight updates used to flip a cancelled run back to "running"
+            # — where it stayed forever, because the abort path never reaches
+            # finishRun. Terminal is final; only the store decides that.
+            settled = run.get("status") in TERMINAL_STATES
+            if status and not (settled and status not in TERMINAL_STATES):
                 run["status"] = status
                 if status in TERMINAL_STATES:
                     run["completed_at"] = utc_now()
@@ -169,6 +212,8 @@ class RunStore:
                         run[key] = max(1, min(4, int(payload[key] or 1)))
                     elif key == "effort_source":
                         run[key] = payload[key] if payload[key] in {"auto", "manual", "model"} else "auto"
+                    elif key == "tasks" and settled:
+                        run[key] = _settle_tasks(payload[key], run.get("status", "cancelled"))
                     else:
                         run[key] = payload[key]
             self._append_event_unlocked(run, f"run.{status}" if status else "run.updated", {
@@ -187,10 +232,23 @@ class RunStore:
             if run.get("status") not in TERMINAL_STATES:
                 run["status"] = "cancelled"
                 run["completed_at"] = utc_now()
+            # Without this the run reads "Cancelled" while every unfinished
+            # subtask under it keeps spinning as "running".
+            run["tasks"] = _settle_tasks(run.get("tasks"), "cancelled")
             self._append_event_unlocked(run, "run.cancelled", {"reason": "user request"})
             self._save()
             self.changed.notify_all()
             return copy.deepcopy(run)
+
+    def clear_finished(self) -> dict[str, int]:
+        """Drop every settled run, keeping anything still in flight."""
+        with self.lock:
+            before = len(self._runs)
+            kept = [r for r in self._runs if r.get("status") not in TERMINAL_STATES]
+            self._runs = kept
+            self._save()
+            self.changed.notify_all()
+            return {"cleared": before - len(kept), "kept": len(kept)}
 
     def retry(self, run_id: str) -> dict[str, Any] | None:
         original = self.get(run_id)

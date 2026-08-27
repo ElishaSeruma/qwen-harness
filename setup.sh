@@ -46,7 +46,25 @@ ensure_model gemma2:2b   "~1.6 GB – light agent"
 
 echo ""
 echo "── 4. Python dependencies ──────────────────────────────"
-python3 -m pip install --break-system-packages \
+
+# --break-system-packages is NOT unconditional. It is required on a PEP 668
+# "externally managed" interpreter (Homebrew python3.12+ refuses to install
+# without it) but it does not exist before pip 23, and passing it to an older
+# pip is a hard error — Xcode's bundled python3.9 ships pip 21.2.4 and dies
+# with "no such option". Detect support instead of assuming either way.
+PIP_FLAGS=()
+if python3 -m pip install --help 2>/dev/null | grep -q -- '--break-system-packages'; then
+  if python3 -c "import os,sysconfig,sys; sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path('stdlib'),'EXTERNALLY-MANAGED')) else 1)"; then
+    PIP_FLAGS+=(--break-system-packages)
+    echo "   (externally-managed interpreter — using --break-system-packages)"
+  fi
+else
+  # Old pip: no PEP 668 enforcement either, so a plain --user install is fine.
+  PIP_FLAGS+=(--user)
+  echo "   (pip is older than 23 — installing with --user)"
+fi
+
+python3 -m pip install "${PIP_FLAGS[@]}" \
   openai \
   playwright \
   pyautogui \

@@ -37,6 +37,10 @@
         <span class="rail-icon" aria-hidden="true">✦</span>
         <span>Skills &amp; tools</span>
       </button>
+      <button class="rail-link" type="button" data-route="profile">
+        <span class="rail-icon" aria-hidden="true">☺</span>
+        <span>Profile</span>
+      </button>
     </nav>
     <button class="rail-theme" id="theme-toggle" type="button" title="Toggle dark mode">
       <span id="theme-icon">◐</span>
@@ -57,6 +61,9 @@
         </button>
         <button id="tools-toggle" class="activity-toggle" type="button" aria-expanded="false" title="List every tool the models can call">
           Tools <span id="tools-count">0</span>
+        </button>
+        <button id="feedback-toggle" class="activity-toggle" type="button" data-learning="off" title="Ratings you've given">
+          Ratings <span id="feedback-count">0</span>
         </button>
         <button id="activity-toggle" class="activity-toggle" type="button" aria-expanded="false" title="Open activity">
           Activity <span id="activity-count">0</span>
@@ -505,6 +512,33 @@
           </div>
         </div>
       </div>
+    </main>
+
+    <!-- ── PROFILE ───────────────────────────────────────────────────── -->
+    <main class="skills-view view" id="view-profile" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Your profile</h2>
+          <p class="panel-copy">
+            Sent to every model in its system prompt, so they work from who you
+            actually are instead of guessing. Every field is optional — blanks
+            are never mentioned to the model.
+          </p>
+        </div>
+        <p class="profile-tripwire" id="profile-tripwire" hidden>
+          Once your name is set, a model calling you anything else is a
+          hallucination marker — it means it stopped reading its context.
+        </p>
+        <form id="profile-form" class="profile-form" autocomplete="off"></form>
+        <div class="profile-actions">
+          <button type="button" id="profile-save" class="send-button">Save profile</button>
+          <span class="profile-status" id="profile-status" role="status"></span>
+        </div>
+        <details class="run-audit profile-preview">
+          <summary>What the models are told</summary>
+          <pre class="process-step-detail" id="profile-preview">Nothing yet — fill in a field and save.</pre>
+        </details>
+      </section>
     </main>
 
     <!-- ── SKILLS & TOOLS ───────────────────────────────────────────── -->

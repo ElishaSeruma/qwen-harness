@@ -161,6 +161,90 @@ def browser_screenshot(selector: Optional[str] = None) -> dict:
     return {"status": "ok", "path": str(path)}
 
 
+# ── Headless rendering (for scrape_url's SPA fallback) ───────────────────────
+# Deliberately a SEPARATE browser from the interactive one above:
+#  * headless, so an automatic fallback never pops a window in your face
+#  * its own instance, so rendering a page mid-task cannot navigate away from
+#    whatever an agent is driving in the interactive session
+_render_playwright = None
+_render_browser = None
+
+
+class RendererUnavailable(RuntimeError):
+    """Playwright or its Chromium build is missing."""
+
+
+def _get_render_browser():
+    global _render_playwright, _render_browser
+    if _render_browser is not None:
+        return _render_browser
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RendererUnavailable(
+            "playwright is not installed, so JavaScript-rendered pages cannot be read. "
+            "Install it with:  python3 -m pip install --break-system-packages playwright "
+            "&& python3 -m playwright install chromium"
+        ) from exc
+    try:
+        _render_playwright = sync_playwright().start()
+        _render_browser = _render_playwright.chromium.launch(headless=True, args=["--no-sandbox"])
+    except Exception as exc:
+        _render_playwright = _render_browser = None
+        raise RendererUnavailable(
+            f"could not launch headless Chromium: {exc}. "
+            "Try:  python3 -m playwright install chromium"
+        ) from exc
+    return _render_browser
+
+
+def render_url(url: str, timeout: int = 30_000, max_chars: int = 8_000) -> dict:
+    """Load `url` in headless Chromium and return the text the user would see.
+
+    This is what makes an SPA readable: the static HTML of Instagram, X, or any
+    React app carries no content, so a plain HTTP fetch returns an empty shell.
+    """
+    browser = _get_render_browser()
+    context = browser.new_context(
+        viewport={"width": 1280, "height": 900},
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+    )
+    page = context.new_page()
+    try:
+        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        # domcontentloaded fires before the app has painted; give the framework
+        # a moment to render, but never block the whole timeout on a page that
+        # polls forever (chat apps, live feeds).
+        try:
+            page.wait_for_load_state("networkidle", timeout=min(8_000, timeout))
+        except Exception:
+            pass
+        text = page.inner_text("body")
+        return {
+            "status": "ok",
+            "url": page.url,
+            "title": page.title(),
+            "text": text[:max_chars],
+            "truncated": len(text) > max_chars,
+            "http_status": response.status if response else None,
+            "rendered": True,
+        }
+    finally:
+        context.close()
+
+
+def close_renderer() -> dict:
+    global _render_playwright, _render_browser
+    if _render_browser:
+        _render_browser.close()
+        _render_playwright.stop()
+        _render_browser = _render_playwright = None
+    return {"status": "ok"}
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 def close_browser() -> dict:

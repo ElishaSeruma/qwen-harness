@@ -86,7 +86,11 @@ def invalidate_grants() -> None:
 
 
 def _read_granted_roots() -> tuple[Path, ...]:
-    roots = {REPO_ROOT}
+    # The sandbox root is harness-owned scratch space. It has to be writable or
+    # every staged edit fails the grant check — which is exactly what happened:
+    # writes "succeeded" as staged no-ops and the tests then ran against
+    # unmodified code.
+    roots = {REPO_ROOT, STATE_DIR / "sandboxes"}
     try:
         payload = json.loads(PERMISSIONS_PATH.read_text(encoding="utf-8"))
         roots.update(Path(value).expanduser() for value in payload.get("roots", []))

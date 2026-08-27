@@ -7,8 +7,23 @@ function parsePlan(text) {
   if (start < 0 || end <= start) throw new Error('Planner returned no task array');
   const rows = JSON.parse(cleaned.slice(start, end + 1));
   if (!Array.isArray(rows) || !rows.length) throw new Error('Planner returned an empty task array');
+  // Task ids must be unique: they key dependency resolution AND every
+  // task-scoped run event. Planners routinely hand back the same id twice
+  // (observed: both tasks returned id "agent-2"), which silently collapsed
+  // two tasks into one in the audit trail.
+  const seen = new Set();
+  const uniqueId = (raw, index) => {
+    let id = String(raw || `task-${index + 1}`);
+    if (seen.has(id)) {
+      let n = 2;
+      while (seen.has(`${id}-${n}`)) n += 1;
+      id = `${id}-${n}`;
+    }
+    seen.add(id);
+    return id;
+  };
   return rows.slice(0, 8).map((row, index) => ({
-    id: String(row.id || `task-${index + 1}`),
+    id: uniqueId(row.id, index),
     title: String(row.title || `Task ${index + 1}`).slice(0, 120),
     instruction: String(row.instruction || row.title || '').slice(0, 6000),
     role: String(row.role || 'executor').toLowerCase(),
